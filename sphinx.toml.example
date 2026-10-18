@@ -1,0 +1,31 @@
+# sphinx - configuration.
+# Copy to `sphinx.toml` (gitignored) and keep the coordinates in sync with
+# `/am semaphore coords` after any window resize. All points are WoW
+# client-area physical pixels (window movement is compensated at use time).
+
+poll_ms = 50           # poll period; contract wants >=20 Hz (<=50 ms)
+kill_hotkey = "ctrl+alt+f12" # HOLD to kill sphinx within one poll; no hook, GetAsyncKeyState
+require_foreground = true    # sendinput: refuse to actuate unless WoW is foreground
+focus_if_needed = false      # sendinput: best-effort SetForegroundWindow first (Windows may refuse)
+debounce_ms = 25       # same CMD color on two polls at least this far apart
+watchdog_ms = 10000    # strobe white longer than this -> idle, never re-actuate
+
+# Calibration reference dumped by `/am semaphore coords` (doctor compares the
+# live desktop against it; sphinx never derives coordinates from these).
+# NOTE: keep these lines ABOVE every [section] - they are top-level keys.
+screen   = { width = 1920, height = 1080 }
+ui_scale = 0.65
+
+[pixels]               # from `/am semaphore coords`
+cmd    = { x = 7, y = 7 }
+strobe = { x = 7, y = 15 }
+
+[targets]              # live button centers from `/am semaphore coords`
+buyout  = { x = 304, y = 434 }
+confirm = { x = 285, y = 315 }
+
+[abort_key]
+key = "escape"         # v1 supports "escape" only (BuyDialog cancel path)
+
+[backend]
+kind = "sendinput"     # "sendinput" now; "window"/"serial" are planned (PLAN.md 5.4/8)

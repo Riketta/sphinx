@@ -1,0 +1,156 @@
+//! Inbound adapter: the kill hotkey, polled via `GetAsyncKeyState` (no
+//! global hook, §3.6). The key combination itself is config-driven
+//! (`kill_hotkey = "ctrl+alt+f12"` by default) — nothing is hardcoded.
+
+use tracing::trace;
+use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+
+use crate::ports::ControlInput;
+
+/// The ESC virtual-key code, shared by `[abort_key]` validation.
+pub const VK_ESCAPE: u8 = 0x1B;
+
+/// A parsed hotkey: modifier + main key codes checked on every poll.
+pub struct Hotkey {
+    spec: String,
+    codes: Vec<u8>,
+}
+
+impl Hotkey {
+    /// Parses a `+`-separated combination like `ctrl+alt+f12` or
+    /// `ctrl+shift+q`. Errors name the supported key names so bad config
+    /// fails fast at startup instead of disabling the kill switch silently.
+    ///
+    /// # Errors
+    /// Empty input, unknown key names, all-modifier combinations.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let mut codes = Vec::new();
+        let mut all_modifiers = true;
+        for part in spec.split('+') {
+            let name = part.trim().to_lowercase();
+            if name.is_empty() {
+                return Err(format!("empty key part in hotkey {spec:?}"));
+            }
+            let Some(code) = key_code(&name) else {
+                return Err(format!(
+                    "unknown key {name:?} in hotkey {spec:?} (supported: ctrl, alt, shift, \
+                     win, f1-f24, a-z, 0-9, escape, tab, space, enter, backspace, insert, \
+                     delete, home, end, pageup, pagedown)"
+                ));
+            };
+            all_modifiers &=
+                matches!(name.as_str(), "ctrl" | "control" | "alt" | "shift" | "win" | "super");
+            codes.push(code);
+        }
+        if codes.is_empty() || all_modifiers {
+            return Err(format!("hotkey {spec:?} needs a non-modifier main key"));
+        }
+        Ok(Self { spec: spec.to_string(), codes })
+    }
+
+    /// The original config string (for `doctor` output).
+    pub fn spec(&self) -> &str {
+        &self.spec
+    }
+
+    /// True while every key of the combination is held down.
+    pub fn is_down(&self) -> bool {
+        self.codes.iter().all(|&vk| {
+            // SAFETY: polled async key state; the documented non-hook way
+            // to implement the kill switch. The high bit of the i16 result
+            // means "currently down".
+            unsafe { GetAsyncKeyState(i32::from(vk)) }.is_negative()
+        })
+    }
+}
+
+impl ControlInput for Hotkey {
+    fn kill_requested(&mut self) -> bool {
+        let down = self.is_down();
+        if down {
+            trace!("kill hotkey is down");
+        }
+        down
+    }
+}
+
+/// Shared key-name -> virtual-key table (kill hotkey + `[abort_key]`).
+pub fn key_code(name: &str) -> Option<u8> {
+    let named = match name {
+        "ctrl" | "control" => 0x11,
+        "alt" | "menu" => 0x12,
+        "shift" => 0x10,
+        "win" | "super" => 0x5B,
+        "escape" | "esc" => VK_ESCAPE,
+        "tab" => 0x09,
+        "space" => 0x20,
+        "enter" => 0x0D,
+        "backspace" => 0x08,
+        "insert" => 0x2D,
+        "delete" => 0x2E,
+        "home" => 0x24,
+        "end" => 0x23,
+        "pageup" => 0x21,
+        "pagedown" => 0x22,
+        "capslock" => 0x14,
+        "numlock" => 0x90,
+        "scrolllock" => 0x91,
+        _ => 0,
+    };
+    if named != 0 {
+        return Some(named);
+    }
+    let mut chars = name.chars();
+    if let (Some(c), None) = (chars.next(), chars.next()) {
+        if c.is_ascii_lowercase() {
+            return u8::try_from(u32::from(c) - u32::from('a') + 0x41).ok();
+        }
+        if c.is_ascii_digit() {
+            return u8::try_from(u32::from(c) - u32::from('0') + 0x30).ok();
+        }
+    }
+    name.strip_prefix('f')
+        .and_then(|rest| rest.parse::<u32>().ok())
+        .filter(|n| (1..=24).contains(n))
+        .and_then(|n| u8::try_from(0x70 + n - 1).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        key_code,
+        Hotkey,
+    };
+
+    #[test]
+    fn parses_modifier_combinations() {
+        let hk = Hotkey::parse("ctrl+alt+f12").map_err(|e| e.clone());
+        assert!(hk.is_ok());
+        assert_eq!(hk.map(|h| h.spec().to_string()), Ok("ctrl+alt+f12".to_string()));
+    }
+
+    #[test]
+    fn rejects_unknown_names() {
+        assert!(Hotkey::parse("ctrl+f25").is_err());
+        assert!(Hotkey::parse("ctrl+").is_err());
+        assert!(Hotkey::parse("").is_err());
+    }
+
+    #[test]
+    fn rejects_all_modifier_hotkeys() {
+        assert!(Hotkey::parse("ctrl+alt").is_err());
+        assert!(Hotkey::parse("shift").is_err());
+    }
+
+    #[test]
+    fn key_table_covers_documented_names() {
+        assert_eq!(key_code("escape"), Some(0x1B));
+        assert_eq!(key_code("ctrl"), Some(0x11));
+        assert_eq!(key_code("a"), Some(0x41));
+        assert_eq!(key_code("5"), Some(0x35));
+        assert_eq!(key_code("f1"), Some(0x70));
+        assert_eq!(key_code("f12"), Some(0x7B));
+        assert_eq!(key_code("f24"), Some(0x87));
+        assert_eq!(key_code("nope"), None);
+    }
+}

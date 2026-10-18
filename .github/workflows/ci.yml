@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  windows:
+    name: Windows · fmt / clippy / test / build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustfmt.toml uses unstable options, so formatting must run under
+      # nightly rustfmt; clippy/tests/build stay on the stable toolchain
+      # pinned by rust-toolchain.toml (installed explicitly because plain
+      # `cargo` must resolve stable regardless of install order).
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format (nightly rustfmt options)
+        run: cargo +nightly fmt --all --check
+
+      - name: "Clippy (pedantic + denied unwrap/expect/panic/indexing/slicing)"
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests (core state machine with fake ports)
+        run: cargo test
+
+      - name: Build
+        run: cargo build
