@@ -44,6 +44,7 @@ use crate::{
     config::Config,
     domain::{
         Clock,
+        Command,
         Core,
         CoreTargets,
         CoreTiming,
@@ -247,7 +248,21 @@ fn doctor(cfg: &Config, smoke: bool) -> anyhow::Result<()> {
     let mut failures: usize = 0;
 
     info!(dpi = system_dpi(), "dpi: process is per-monitor aware (96 = 100%)");
+    doctor_screen(cfg);
+    failures += doctor_window(cfg);
+    doctor_ui_scale(cfg);
+    doctor_pixels(cfg);
+    doctor_kill(cfg);
+    failures += doctor_smoke(cfg, smoke)?;
 
+    if failures > 0 {
+        bail!("doctor: {failures} check(s) failed");
+    }
+    info!("doctor: all checks passed");
+    Ok(())
+}
+
+fn doctor_screen(cfg: &Config) {
     let (w, h) = screen_size();
     match &cfg.screen {
         Some(s) if s.width == w && s.height == h => {
@@ -264,50 +279,76 @@ fn doctor(cfg: &Config, smoke: bool) -> anyhow::Result<()> {
         }
         None => info!(width = w, height = h, "screen: no reference in config"),
     }
+}
 
+/// Returns 1 when the game window cannot be found (everything downstream
+/// depends on it), 0 otherwise.
+fn doctor_window(cfg: &Config) -> usize {
     let game = GameWindow::new(&cfg.process_names());
-    let found = game.find();
-    if let Some(info) = &found {
-        info!(
-            pid = info.pid,
-            title = %info.title,
-            client_width = info.client.0,
-            client_height = info.client.1,
-            "window: game found"
+    let Some(info) = game.find() else {
+        warn!(
+            searched = ?cfg.process_names(),
+            "window: no process matched - if the client runs under another \
+             image name, add it to [backend.window] process_names in sphinx.toml"
         );
-    } else {
-        warn!("window: game process not found (start the client)");
-        failures += 1;
-    }
+        return 1;
+    };
+    info!(
+        pid = info.pid,
+        title = %info.title,
+        image = %window_process_image(info.hwnd).unwrap_or_default(),
+        client_width = info.client.0,
+        client_height = info.client.1,
+        "window: game found"
+    );
 
-    match (foreground_hwnd(), &found) {
-        (Some(fg), Some(info)) if same_window(fg, info.hwnd) => {
-            info!("foreground: the game window");
-        }
-        (Some(fg), _) => {
+    match foreground_hwnd() {
+        Some(fg) if same_window(fg, info.hwnd) => info!("foreground: the game window"),
+        Some(fg) => {
             let title = window_title(fg);
             let image = window_process_image(fg).unwrap_or_default();
             info!(title = %title, image = %image, "foreground: another window");
         }
-        (None, _) => info!("foreground: none"),
+        None => info!("foreground: none"),
     }
+    0
+}
 
+fn doctor_ui_scale(cfg: &Config) {
     if let Some(scale) = cfg.ui_scale {
         info!(ui_scale = scale, "ui_scale: reference value from the addon dump");
     }
+}
 
+fn doctor_pixels(cfg: &Config) {
     let mut reader = build_reader(cfg);
     let cmd = reader.read_point((cfg.pixels.cmd.x, cfg.pixels.cmd.y));
     let strobe = reader.read_point((cfg.pixels.strobe.x, cfg.pixels.strobe.y));
-    info!(
-        cmd = %cmd,
-        strobe = %strobe,
-        "pixels: semaphore samples (with the semaphore disabled both should be #000000)"
-    );
-    if cmd == Rgb::BLACK && strobe == Rgb::BLACK {
-        info!("pixels: idle colors are exact black - clean sampling");
+    info!(cmd = %cmd, strobe = %strobe, "pixels: semaphore samples");
+    // The addon hides both frames while the semaphore is disabled, so sphinx
+    // then reads whatever the game renders underneath - only exact contract
+    // colors are meaningful, anything else must never actuate (and doesn't:
+    // the core ignores unknown CMD colors and only fires on a white strobe).
+    if strobe == Rgb::WHITE {
+        warn!(
+            "pixels: strobe is WHITE at rest - a command is committed, or the \
+             points are misaligned; re-check with `/am semaphore coords`"
+        );
+    } else if cmd == Rgb::BLACK {
+        info!("pixels: idle exact black - semaphore visible and idle, clean sampling");
+    } else if Command::from_rgb(cmd).is_some() {
+        info!(
+            cmd = %cmd,
+            "pixels: CMD armed (fine mid hand-off); expect strobe to commit shortly"
+        );
     } else {
-        warn!("pixels: non-black idle - check HDR / overlays / occlusion at those points");
+        info!(
+            cmd = %cmd,
+            strobe = %strobe,
+            "pixels: non-contract colors - semaphore likely disabled (frames \
+             hidden, game pixels underneath); enable `/am semaphore` to verify \
+             exact-color sampling"
+        );
     }
     let buyout = reader.read_point((cfg.targets.buyout.x, cfg.targets.buyout.y));
     let confirm = reader.read_point((cfg.targets.confirm.x, cfg.targets.confirm.y));
@@ -316,32 +357,38 @@ fn doctor(cfg: &Config, smoke: bool) -> anyhow::Result<()> {
         confirm = %confirm,
         "targets: samples (meaningful with the AH buy screen open; use `calibrate` to align)"
     );
+}
 
-    let kill = Hotkey::parse(&cfg.kill_hotkey).map_err(anyhow::Error::msg)?;
-    info!(kill = kill.spec(), "kill: hold to exit within one poll (GetAsyncKeyState, no hook)");
+fn doctor_kill(cfg: &Config) {
+    match Hotkey::parse(&cfg.kill_hotkey) {
+        Ok(kill) => info!(
+            kill = kill.spec(),
+            "kill: hold to exit within one poll (GetAsyncKeyState, no hook)"
+        ),
+        Err(e) => warn!("kill: {e}"),
+    }
+}
 
-    if smoke {
-        let mut kbm = SendInputKbm::new(false, false, GameWindow::new(&cfg.process_names()))
-            .context("enigo init failed")?;
-        let before = kbm.cursor();
-        match kbm.smoke_move() {
-            Ok(()) => info!(
-                from_x = before.0,
-                from_y = before.1,
-                to_x = kbm.cursor().0,
-                to_y = kbm.cursor().1,
-                "smoke: pointer moved (+1, +1) and back"
-            ),
-            Err(e) => {
-                warn!(error = %e, "smoke: pointer move failed");
-                failures += 1;
-            }
+/// Returns 1 when the smoke test was requested and failed.
+fn doctor_smoke(cfg: &Config, smoke: bool) -> anyhow::Result<usize> {
+    if !smoke {
+        return Ok(0);
+    }
+    let mut kbm = SendInputKbm::new(false, false, GameWindow::new(&cfg.process_names()))
+        .context("enigo init failed")?;
+    let before = kbm.cursor();
+    match kbm.smoke_move() {
+        Ok(()) => info!(
+            from_x = before.0,
+            from_y = before.1,
+            to_x = kbm.cursor().0,
+            to_y = kbm.cursor().1,
+            "smoke: pointer moved (+1, +1) and back"
+        ),
+        Err(e) => {
+            warn!(error = %e, "smoke: pointer move failed");
+            return Ok(1);
         }
     }
-
-    if failures > 0 {
-        bail!("doctor: {failures} check(s) failed");
-    }
-    info!("doctor: all checks passed");
-    Ok(())
+    Ok(0)
 }

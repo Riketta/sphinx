@@ -29,3 +29,6 @@ key = "escape"         # v1 supports "escape" only (BuyDialog cancel path)
 
 [backend]
 kind = "sendinput"     # "sendinput" now; "window"/"serial" are planned (PLAN.md 5.4/8)
+# Game discovery matches these image names (case-insensitive). Defaults:
+# wowb.exe, wow.exe, wowclassic.exe, wow-64.exe. Override only if yours differs:
+# window = { process_names = ["wowb.exe"] }

@@ -44,9 +44,9 @@ use windows::Win32::{
     },
 };
 
-/// Client process image names sphinx looks for (case-insensitive), matching
-/// the fork and retail-adjacent names (§5.4b's discovery list).
-pub const DEFAULT_PROCESS_NAMES: &[&str] = &["wow.exe", "wowclassic.exe", "wow-64.exe"];
+/// Client process image names sphinx looks for (case-insensitive). `WowB.exe`
+/// is this fork's client; the others cover common `WoW` binary names.
+pub const DEFAULT_PROCESS_NAMES: &[&str] = &["wowb.exe", "wow.exe", "wowclassic.exe", "wow-64.exe"];
 
 /// A discovered game window: everything later calls need to translate
 /// client coordinates or check the foreground policy.
