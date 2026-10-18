@@ -4,7 +4,10 @@
 use std::{
     path::PathBuf,
     thread,
-    time::Duration,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use anyhow::{
@@ -25,6 +28,8 @@ mod config;
 mod domain;
 mod ports;
 
+#[cfg(feature = "serial")]
+use crate::adapters::kbm::SerialKbm;
 use crate::{
     adapters::{
         game_window::{
@@ -41,7 +46,10 @@ use crate::{
         kbm::SendInputKbm,
         pixel_reader::PixelReader,
     },
-    config::Config,
+    config::{
+        BackendKind,
+        Config,
+    },
     domain::{
         Clock,
         Command,
@@ -74,6 +82,9 @@ enum AnyKbm {
     Live(SendInputKbm),
     /// Rehearsal: logs what would happen; never sends input.
     Dry { require_foreground: bool, game: GameWindow },
+    /// UART -> HID hardware input (feature `serial`).
+    #[cfg(feature = "serial")]
+    Serial(SerialKbm),
 }
 
 impl Kbm for AnyKbm {
@@ -84,6 +95,8 @@ impl Kbm for AnyKbm {
                 dry_note(*require_foreground, game, "press");
                 info!("[dry-run] would press ({x}, {y})");
             }
+            #[cfg(feature = "serial")]
+            Self::Serial(kbm) => kbm.press(x, y),
         }
     }
 
@@ -94,6 +107,8 @@ impl Kbm for AnyKbm {
                 dry_note(*require_foreground, game, "key");
                 info!("[dry-run] would send {key:?}");
             }
+            #[cfg(feature = "serial")]
+            Self::Serial(kbm) => kbm.key(key),
         }
     }
 
@@ -101,6 +116,8 @@ impl Kbm for AnyKbm {
         match self {
             Self::Live(kbm) => kbm.cursor(),
             Self::Dry { .. } => (0, 0),
+            #[cfg(feature = "serial")]
+            Self::Serial(kbm) => kbm.cursor(),
         }
     }
 }
@@ -183,6 +200,25 @@ fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
         .context("kill_hotkey (emergency stop) is invalid")?;
     let kbm = if dry_run {
         AnyKbm::Dry { require_foreground: cfg.require_foreground, game }
+    } else if cfg.backend.kind == BackendKind::Serial {
+        #[cfg(feature = "serial")]
+        {
+            let serial = cfg.backend.serial.as_ref().context("backend.serial missing")?;
+            AnyKbm::Serial(
+                SerialKbm::new(
+                    &serial.port,
+                    serial.baud,
+                    cfg.require_foreground,
+                    cfg.focus_if_needed,
+                    game.clone(),
+                )
+                .context("serial link init failed")?,
+            )
+        }
+        #[cfg(not(feature = "serial"))]
+        bail!(
+            "backend.kind = \"serial\" needs a build with --features serial (validate should have caught this)"
+        );
     } else {
         AnyKbm::Live(
             SendInputKbm::new(cfg.require_foreground, cfg.focus_if_needed, game)
@@ -201,7 +237,12 @@ fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
             confirm: (cfg.targets.confirm.x, cfg.targets.confirm.y),
         },
         Key::Escape,
-        CoreTiming { debounce_ms: cfg.debounce_ms, watchdog_ms: cfg.watchdog_ms },
+        CoreTiming {
+            debounce_ms: cfg.debounce_ms,
+            watchdog_ms: cfg.watchdog_ms,
+            min_actuation_interval_ms: cfg.min_actuation_interval_ms,
+            max_actuations_per_min: cfg.max_actuations_per_min,
+        },
     );
     info!(
         poll_ms = cfg.poll_ms,
@@ -211,11 +252,26 @@ fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
         backend = if dry_run { "dry-run" } else { "sendinput" },
         "sphinx running (Ctrl+C also exits)"
     );
+    let start = Instant::now();
+    let mut last_beat = start;
     loop {
         if core.step() == StepOutcome::Exit {
             // Immediate exit on the kill switch (§3.6): the addon's stage
             // timeouts clean up the game state.
             std::process::exit(0);
+        }
+        // Soak-test heartbeat (M4): one visibility line per 5 minutes, so a
+        // quiet healthy session is distinguishable from a dead terminal.
+        if last_beat.elapsed() >= Duration::from_secs(300) {
+            let stats = core.stats();
+            info!(
+                uptime_s = start.elapsed().as_secs(),
+                actuations = stats.actuations,
+                aborts = stats.aborts,
+                watchdogs = stats.watchdogs,
+                "heartbeat"
+            );
+            last_beat = Instant::now();
         }
         thread::sleep(Duration::from_millis(cfg.poll_ms));
     }
@@ -373,6 +429,26 @@ fn doctor_kill(cfg: &Config) {
 fn doctor_smoke(cfg: &Config, smoke: bool) -> anyhow::Result<usize> {
     if !smoke {
         return Ok(0);
+    }
+    if cfg.backend.kind == BackendKind::Serial {
+        // A serial build's smoke test is the link handshake itself: opening
+        // the port pings the MCU, which must ack.
+        #[cfg(feature = "serial")]
+        {
+            let serial = cfg.backend.serial.as_ref().context("backend.serial missing")?;
+            SerialKbm::new(
+                &serial.port,
+                serial.baud,
+                cfg.require_foreground,
+                cfg.focus_if_needed,
+                GameWindow::new(&cfg.process_names()),
+            )
+            .context("smoke: serial link ping failed")?;
+            info!("smoke: serial link ping acked");
+            return Ok(0);
+        }
+        #[cfg(not(feature = "serial"))]
+        return Ok(0); // validate() already refused this combination
     }
     let mut kbm = SendInputKbm::new(false, false, GameWindow::new(&cfg.process_names()))
         .context("enigo init failed")?;

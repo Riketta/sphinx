@@ -41,8 +41,14 @@ jobs:
       - name: "Clippy (pedantic + denied unwrap/expect/panic/indexing/slicing)"
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: "Clippy (serial feature: v2 hardware backend)"
+        run: cargo clippy --all-targets --features serial -- -D warnings
+
       - name: Tests (core state machine with fake ports)
         run: cargo test
+
+      - name: Tests (serial protocol ack/retry)
+        run: cargo test --features serial
 
       - name: Build
         run: cargo build

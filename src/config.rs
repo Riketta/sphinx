@@ -39,6 +39,19 @@ fn d_watchdog_ms() -> u64 {
     10_000
 }
 
+/// Burst-guard default: the addon's own hand-off cycle is seconds long, so
+/// two actuations under 250 ms apart mean a runaway signal source.
+fn d_min_interval_ms() -> u64 {
+    250
+}
+
+/// Burst-guard default: a healthy session stays far below this; the ceiling
+/// only exists so a signal storm degrades into skipped actuations (visible,
+/// logged) instead of a clicking fit.
+fn d_max_per_min() -> u32 {
+    30
+}
+
 fn d_true() -> bool {
     true
 }
@@ -184,6 +197,12 @@ pub struct Config {
     /// Strobe watchdog (ms): white longer than this -> idle, never re-actuate.
     #[serde(default = "d_watchdog_ms")]
     pub watchdog_ms: u64,
+    /// Burst guard: minimum gap between two actuations (0 disables).
+    #[serde(default = "d_min_interval_ms")]
+    pub min_actuation_interval_ms: u64,
+    /// Burst guard: rolling per-minute actuation ceiling (>= 1).
+    #[serde(default = "d_max_per_min")]
+    pub max_actuations_per_min: u32,
     /// Semaphore pixel points.
     #[serde(default)]
     pub pixels: PixelPoints,
@@ -246,6 +265,15 @@ impl Config {
         if self.watchdog_ms < 2 * self.poll_ms {
             bail!("watchdog_ms {} must be >= 2x poll_ms {}", self.watchdog_ms, self.poll_ms);
         }
+        if self.min_actuation_interval_ms > 60_000 {
+            bail!(
+                "min_actuation_interval_ms {} > 60_000 (that disables the sniper, not bursts)",
+                self.min_actuation_interval_ms
+            );
+        }
+        if !(1..=600).contains(&self.max_actuations_per_min) {
+            bail!("max_actuations_per_min {} outside 1..=600", self.max_actuations_per_min);
+        }
         Hotkey::parse(&self.kill_hotkey).map_err(|e| {
             anyhow::anyhow!("kill_hotkey {e} (this is your emergency stop - fix it)")
         })?;
@@ -260,13 +288,31 @@ impl Config {
                 bail!("backend.kind = \"window\" is planned (PLAN.md 5.4b); use \"sendinput\"")
             }
             BackendKind::Serial => {
-                let conn = self
-                    .backend
-                    .serial
-                    .as_ref()
-                    .map(|s| format!(" (port {} @ {} baud configured)", s.port, s.baud))
-                    .unwrap_or_default();
-                bail!("backend.kind = \"serial\" is v2 (PLAN.md 8){conn}; use \"sendinput\"");
+                #[cfg(not(feature = "serial"))]
+                {
+                    let detail = self
+                        .backend
+                        .serial
+                        .as_ref()
+                        .map(|s| format!(" (port {} @ {} baud configured)", s.port, s.baud))
+                        .unwrap_or_default();
+                    bail!(
+                        "backend.kind = \"serial\" is v2 hardware input; rebuild with --features serial{detail}"
+                    );
+                }
+                #[cfg(feature = "serial")]
+                let Some(s) = self.backend.serial.as_ref() else {
+                    bail!("backend.kind = \"serial\" needs [backend.serial] with port and baud");
+                };
+                #[cfg(feature = "serial")]
+                {
+                    if s.port.trim().is_empty() {
+                        bail!("backend.serial.port must not be empty");
+                    }
+                    if s.baud == 0 {
+                        bail!("backend.serial.baud must be > 0");
+                    }
+                }
             }
         }
         if let Some(screen) = &self.screen {

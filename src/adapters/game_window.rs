@@ -76,6 +76,7 @@ impl GameWindowInfo {
 
 /// Finds the game window by process image name. Re-run per use: handles
 /// client restarts and never caches a dead handle.
+#[derive(Clone)]
 pub struct GameWindow {
     process_names: Vec<String>,
 }

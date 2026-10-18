@@ -10,6 +10,8 @@
 //! Kill hotkey -> Exit (checked first, every poll).
 //! ```
 
+use std::collections::VecDeque;
+
 use tracing::{
     debug,
     info,
@@ -44,13 +46,30 @@ pub struct CoreTargets {
     pub confirm: (i32, i32),
 }
 
-/// Contract timings (§3.3/§3.4), config-driven.
+/// Contract timings (§3.3/§3.4) plus the M4 burst guard, config-driven.
 #[derive(Clone, Copy, Debug)]
 pub struct CoreTiming {
     /// The CMD color must hold on two polls at least this far apart.
     pub debounce_ms: u64,
     /// Strobe white longer than this -> treat as idle, never re-actuate.
     pub watchdog_ms: u64,
+    /// Burst guard: minimum gap between two actuations (0 disables). The
+    /// addon's hand-off cycle is seconds long - faster edges are a runaway
+    /// signal source, and the second click is refused.
+    pub min_actuation_interval_ms: u64,
+    /// Burst guard: rolling per-minute actuation ceiling (>= 1).
+    pub max_actuations_per_min: u32,
+}
+
+/// Lifetime counters for the heartbeat log (M4 soak visibility).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CoreStats {
+    /// Actuations performed (presses + ESC keys).
+    pub actuations: u64,
+    /// ABORT edges served (ESC sent for the error/abort path).
+    pub aborts: u64,
+    /// Watchdog releases (strobe stuck white / unstable CMD past the limit).
+    pub watchdogs: u64,
 }
 
 /// What the caller should do after one [`Core::step`].
@@ -84,6 +103,14 @@ pub struct Core<R, K, C, T> {
     /// Last strobe sample; `None` until the first poll so a strobe that is
     /// already white at startup is never mistaken for a fresh edge.
     last_strobe: Option<bool>,
+    /// Burst guard: when the last accepted actuation happened.
+    last_actuation_ms: Option<u64>,
+    /// Burst guard: accepted actuation timestamps inside the last minute.
+    recent_actuations: VecDeque<u64>,
+    /// Burst guard warn throttle: when the last skipped-actuation warn fired.
+    last_guard_warn_ms: u64,
+    /// Lifetime counters (heartbeat).
+    stats: CoreStats,
 }
 
 impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
@@ -108,7 +135,16 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
             timing,
             state: State::Idle,
             last_strobe: None,
+            last_actuation_ms: None,
+            recent_actuations: VecDeque::new(),
+            last_guard_warn_ms: 0,
+            stats: CoreStats::default(),
         }
+    }
+
+    /// Lifetime counters (heartbeat logging).
+    pub fn stats(&self) -> CoreStats {
+        self.stats
     }
 
     /// Runs one poll. Never panics on bad input: unknown colors are logged
@@ -136,6 +172,7 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
                     self.state = State::Idle;
                 } else if now.saturating_sub(edge_ms) > self.timing.watchdog_ms {
                     warn!("strobe white past watchdog while CMD unstable -> idle");
+                    self.stats.watchdogs += 1;
                     self.state = State::Idle;
                 } else {
                     let sample = self.reader.read_cmd();
@@ -144,7 +181,7 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
                         self.state = State::Debounce { cmd: sample, first_ms: now, edge_ms };
                     } else if now.saturating_sub(first_ms) >= self.timing.debounce_ms {
                         self.state = State::WaitClear { since_ms: now };
-                        self.decode_and_execute(sample);
+                        self.decode_and_execute(sample, now);
                     }
                 }
             }
@@ -157,6 +194,7 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
                         "strobe stuck white {}ms after actuation -> idle (no re-actuation)",
                         self.timing.watchdog_ms
                     );
+                    self.stats.watchdogs += 1;
                     self.state = State::Idle;
                 }
             }
@@ -169,7 +207,7 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
     /// Decodes a stable CMD and actuates once. The `WaitClear` state is
     /// already entered by the caller, so a failed decode still swallows the
     /// strobe until it rests black (one command per rising edge, §3.3 step 5).
-    fn decode_and_execute(&mut self, sample: Rgb) {
+    fn decode_and_execute(&mut self, sample: Rgb, now: u64) {
         let Some(command) = Command::from_rgb(sample) else {
             warn!(color = %sample, "committed CMD is not a known command -> ignored");
             return;
@@ -180,6 +218,10 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
             warn!(expected = %sample, read = %verified, "CMD changed before actuation -> ignored");
             return;
         }
+        if !self.guard_allows(now) {
+            return;
+        }
+        self.stats.actuations += 1;
         match command {
             Command::Buyout => {
                 let (x, y) = self.targets.buyout;
@@ -192,9 +234,48 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
                 self.kbm.press(x, y);
             }
             Command::Abort => {
+                self.stats.aborts += 1;
                 info!(key = ?self.abort_key, "ABORT: one key per edge");
                 self.kbm.key(self.abort_key);
             }
+        }
+    }
+
+    /// Burst guard (M4): refuses an actuation landing too soon after the
+    /// previous one, or past the rolling per-minute ceiling. The strobe edge
+    /// is still consumed (the caller already entered `WaitClear`) - the
+    /// addon's own stage timeouts surface the skipped command. Sphinx must
+    /// never answer a runaway signal rate with a runaway click rate; warnings
+    /// are throttled so a signal storm logs, not floods.
+    fn guard_allows(&mut self, now: u64) -> bool {
+        if let Some(last) = self.last_actuation_ms {
+            if now.saturating_sub(last) < self.timing.min_actuation_interval_ms {
+                self.guard_warn(now);
+                return false;
+            }
+        }
+        while let Some(front) = self.recent_actuations.front() {
+            if now.saturating_sub(*front) <= 60_000 {
+                break;
+            }
+            self.recent_actuations.pop_front();
+        }
+        if self.recent_actuations.len() >= self.timing.max_actuations_per_min as usize {
+            self.guard_warn(now);
+            return false;
+        }
+        self.recent_actuations.push_back(now);
+        self.last_actuation_ms = Some(now);
+        true
+    }
+
+    fn guard_warn(&mut self, now: u64) {
+        if now.saturating_sub(self.last_guard_warn_ms) >= 2_000 {
+            self.last_guard_warn_ms = now;
+            warn!(
+                "actuation skipped by the burst guard (interval {}ms / ceiling {}/min)",
+                self.timing.min_actuation_interval_ms, self.timing.max_actuations_per_min
+            );
         }
     }
 }
@@ -318,7 +399,13 @@ mod tests {
             clock.clone(),
             CoreTargets { buyout: BUYOUT, confirm: CONFIRM },
             Key::Escape,
-            CoreTiming { debounce_ms: 25, watchdog_ms: 10_000 },
+            // Guard off: existing tests exercise the machine, not the policy.
+            CoreTiming {
+                debounce_ms: 25,
+                watchdog_ms: 10_000,
+                min_actuation_interval_ms: 0,
+                max_actuations_per_min: u32::MAX,
+            },
         )
     }
 
@@ -564,5 +651,135 @@ mod tests {
         assert!(matches!(Command::from_rgb(Rgb::YELLOW), Some(Command::Abort)));
         assert!(Command::from_rgb(Rgb::BLACK).is_none());
         assert!(Command::from_rgb(Rgb::new(255, 0, 1)).is_none());
+    }
+
+    /// One full hand-off from a resting strobe: seed black, white edge, and
+    /// the post-debounce fire. Returns after the actuation (state `WaitClear`).
+    fn run_cycle(
+        reader: &Rc<FakeReader>,
+        _kbm: &Rc<FakeKbm>,
+        _kill: &Rc<FakeKill>,
+        clock: &Rc<FakeClock>,
+        core: &mut Core<Rc<FakeReader>, Rc<FakeKbm>, Rc<FakeKill>, Rc<FakeClock>>,
+        t0: u64,
+    ) {
+        reader.strobe.set(Rgb::BLACK);
+        clock.t.set(t0);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        reader.strobe.set(Rgb::WHITE);
+        clock.t.set(t0 + 50);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        clock.t.set(t0 + 100);
+        assert_eq!(core.step(), StepOutcome::Continue);
+    }
+
+    #[test]
+    fn burst_guard_refuses_rapid_second_actuation() {
+        let reader = FakeReader::new(Rgb::BLACK, vec![]);
+        reader.fallback.set(Rgb::RED);
+        let kbm = Rc::new(FakeKbm::default());
+        let kill = Rc::new(FakeKill::default());
+        let clock = clock();
+        let mut core = Core::new(
+            reader.clone(),
+            kbm.clone(),
+            kill.clone(),
+            clock.clone(),
+            CoreTargets { buyout: BUYOUT, confirm: CONFIRM },
+            Key::Escape,
+            CoreTiming {
+                debounce_ms: 25,
+                watchdog_ms: 10_000,
+                min_actuation_interval_ms: 250,
+                max_actuations_per_min: u32::MAX,
+            },
+        );
+
+        run_cycle(&reader, &kbm, &kill, &clock, &mut core, 0);
+        assert_eq!(pressed(&kbm), vec![BUYOUT]);
+
+        // Second hand-off lands only 150ms after the first actuation:
+        // consumed (WaitClear entered), but not clicked.
+        run_cycle(&reader, &kbm, &kill, &clock, &mut core, 150);
+        assert_eq!(pressed(&kbm), vec![BUYOUT]);
+
+        // Third hand-off is far enough from the accepted actuation: fires.
+        run_cycle(&reader, &kbm, &kill, &clock, &mut core, 400);
+        assert_eq!(pressed(&kbm), vec![BUYOUT, BUYOUT]);
+        assert_eq!(core.stats().actuations, 2);
+    }
+
+    #[test]
+    fn burst_guard_per_minute_ceiling() {
+        let reader = FakeReader::new(Rgb::BLACK, vec![]);
+        reader.fallback.set(Rgb::RED);
+        let kbm = Rc::new(FakeKbm::default());
+        let kill = Rc::new(FakeKill::default());
+        let clock = clock();
+        let mut core = Core::new(
+            reader.clone(),
+            kbm.clone(),
+            kill.clone(),
+            clock.clone(),
+            CoreTargets { buyout: BUYOUT, confirm: CONFIRM },
+            Key::Escape,
+            CoreTiming {
+                debounce_ms: 25,
+                watchdog_ms: 10_000,
+                min_actuation_interval_ms: 0,
+                max_actuations_per_min: 2,
+            },
+        );
+
+        run_cycle(&reader, &kbm, &kill, &clock, &mut core, 100);
+        run_cycle(&reader, &kbm, &kill, &clock, &mut core, 1_100);
+        assert_eq!(pressed(&kbm), vec![BUYOUT, BUYOUT]);
+
+        // Ceiling reached: the third cycle is consumed, not clicked.
+        run_cycle(&reader, &kbm, &kill, &clock, &mut core, 2_100);
+        assert_eq!(pressed(&kbm), vec![BUYOUT, BUYOUT]);
+
+        // An hour later the window has drained: actuation works again.
+        run_cycle(&reader, &kbm, &kill, &clock, &mut core, 61_300);
+        assert_eq!(pressed(&kbm), vec![BUYOUT, BUYOUT, BUYOUT]);
+    }
+
+    #[test]
+    fn heartbeat_counters_track_actuations_aborts_watchdogs() {
+        let reader = FakeReader::new(Rgb::BLACK, vec![Rgb::RED, Rgb::RED, Rgb::RED]);
+        reader.fallback.set(Rgb::YELLOW);
+        let kbm = Rc::new(FakeKbm::default());
+        let kill = Rc::new(FakeKill::default());
+        let clock = clock();
+        let mut core = make_core(&reader, &kbm, &kill, &clock);
+
+        // Seed a black observation so the first white is a real edge.
+        assert_eq!(core.step(), StepOutcome::Continue);
+
+        // Buyout fires (actuation 1)...
+        reader.strobe.set(Rgb::WHITE);
+        clock.t.set(50);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        clock.t.set(100);
+        assert_eq!(core.step(), StepOutcome::Continue);
+
+        // ...the addon dies: strobe sticks white past the watchdog (+1)...
+        clock.t.set(100 + 10_000 + 50);
+        assert_eq!(core.step(), StepOutcome::Continue);
+
+        // ...then an ABORT hand-off runs (actuation 2, abort 1).
+        reader.strobe.set(Rgb::BLACK);
+        clock.t.set(10_200);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        reader.strobe.set(Rgb::WHITE);
+        clock.t.set(10_250);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        clock.t.set(10_300);
+        assert_eq!(core.step(), StepOutcome::Continue);
+
+        let stats = core.stats();
+        assert_eq!(stats.actuations, 2);
+        assert_eq!(stats.aborts, 1);
+        assert_eq!(stats.watchdogs, 1);
     }
 }

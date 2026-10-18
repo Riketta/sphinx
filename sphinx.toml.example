@@ -9,6 +9,8 @@ require_foreground = true    # sendinput: refuse to actuate unless WoW is foregr
 focus_if_needed = false      # sendinput: best-effort SetForegroundWindow first (Windows may refuse)
 debounce_ms = 25       # same CMD color on two polls at least this far apart
 watchdog_ms = 10000    # strobe white longer than this -> idle, never re-actuate
+min_actuation_interval_ms = 250 # burst guard: two actuations closer than this = runaway, second refused
+max_actuations_per_min = 30     # burst guard: rolling ceiling; excess actuations are skipped (logged)
 
 # Calibration reference dumped by `/am semaphore coords` (doctor compares the
 # live desktop against it; sphinx never derives coordinates from these).

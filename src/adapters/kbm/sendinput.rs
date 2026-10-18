@@ -1,7 +1,8 @@
 //! Default KBM backend (§5.4a): hardware-level input via enigo
-//! (`SendInput` stream). Honors the foreground policy: with
-//! `require_foreground`, actuation is refused unless the game window is
-//! foreground — sphinx must never click into another window.
+//! (`SendInput` stream). Honors the foreground policy via the shared
+//! [`ActuationGuard`]: with `require_foreground`, actuation is refused
+//! unless the game window is foreground - sphinx must never click into
+//! another window.
 
 use enigo::{
     Button,
@@ -18,12 +19,9 @@ use tracing::{
 };
 
 use crate::{
-    adapters::game_window::{
-        foreground_hwnd,
-        same_window,
-        try_focus,
-        GameWindow,
-        GameWindowInfo,
+    adapters::{
+        game_window::GameWindow,
+        kbm::guard::ActuationGuard,
     },
     ports::{
         kbm::Key,
@@ -31,11 +29,9 @@ use crate::{
     },
 };
 
-/// enigo-backed actuator with the §5.4 foreground guard built in.
+/// enigo-backed actuator with the foreground guard built in.
 pub struct SendInputKbm {
-    require_foreground: bool,
-    focus_if_needed: bool,
-    game: GameWindow,
+    guard: ActuationGuard,
     enigo: Enigo,
 }
 
@@ -50,9 +46,7 @@ impl SendInputKbm {
         game: GameWindow,
     ) -> Result<Self, enigo::NewConError> {
         Ok(Self {
-            require_foreground,
-            focus_if_needed,
-            game,
+            guard: ActuationGuard::new(require_foreground, focus_if_needed, game),
             enigo: Enigo::new(&Settings::default())?,
         })
     }
@@ -67,41 +61,11 @@ impl SendInputKbm {
         info!(to_x = x, to_y = y, "smoke: moved pointer back");
         Ok(())
     }
-
-    /// Finds the game window and enforces the foreground policy. `None`
-    /// means "skip this actuation" — the addon's stage timeouts clean up.
-    fn prepared(&mut self, action: &str) -> Option<GameWindowInfo> {
-        let Some(info) = self.game.find() else {
-            warn!(action, "WoW window not found; skipping");
-            return None;
-        };
-        if !self.require_foreground {
-            return Some(info);
-        }
-        let foreground_ok = foreground_hwnd().is_some_and(|fg| same_window(fg, info.hwnd));
-        if foreground_ok {
-            return Some(info);
-        }
-        if self.focus_if_needed {
-            info!(action, "WoW lost foreground; trying to focus it");
-            if try_focus(info.hwnd) {
-                return Some(info);
-            }
-            warn!(action, "could not focus WoW; skipping");
-            return None;
-        }
-        warn!(action, "WoW is not foreground; skipping (refusing to click into another window)");
-        None
-    }
 }
 
 impl Kbm for SendInputKbm {
     fn press(&mut self, x: i32, y: i32) {
-        let Some(info) = self.prepared("press") else {
-            return;
-        };
-        let Some((sx, sy)) = info.client_to_screen(x, y) else {
-            warn!("ClientToScreen failed; skipping press");
+        let Some((sx, sy)) = self.guard.prepared_point("press", x, y) else {
             return;
         };
         if let Err(e) = self.enigo.move_mouse(sx, sy, Coordinate::Abs) {
@@ -116,7 +80,7 @@ impl Kbm for SendInputKbm {
     }
 
     fn key(&mut self, key: Key) {
-        if self.prepared("key").is_none() {
+        if !self.guard.prepared_key("key") {
             return;
         }
         let enigo_key = match key {
