@@ -44,6 +44,8 @@ mod ports;
 
 #[cfg(feature = "serial")]
 use crate::adapters::kbm::SerialKbm;
+#[cfg(feature = "vkbm")]
+use crate::adapters::kbm::VkbmKbm;
 use crate::{
     adapters::{
         game_window::{
@@ -114,6 +116,9 @@ enum AnyKbm {
     /// UART -> HID hardware input (feature `serial`).
     #[cfg(feature = "serial")]
     Serial(SerialKbm),
+    /// versa-kbm RP2040 hardware input (feature `vkbm`).
+    #[cfg(feature = "vkbm")]
+    Vkbm(VkbmKbm),
 }
 
 impl Kbm for AnyKbm {
@@ -127,6 +132,8 @@ impl Kbm for AnyKbm {
             }
             #[cfg(feature = "serial")]
             Self::Serial(kbm) => kbm.press(x, y),
+            #[cfg(feature = "vkbm")]
+            Self::Vkbm(kbm) => kbm.press(x, y),
         }
     }
 
@@ -140,6 +147,8 @@ impl Kbm for AnyKbm {
             }
             #[cfg(feature = "serial")]
             Self::Serial(kbm) => kbm.key(key),
+            #[cfg(feature = "vkbm")]
+            Self::Vkbm(kbm) => kbm.key(key),
         }
     }
 
@@ -149,6 +158,8 @@ impl Kbm for AnyKbm {
             Self::Dry { .. } => (0, 0),
             #[cfg(feature = "serial")]
             Self::Serial(kbm) => kbm.cursor(),
+            #[cfg(feature = "vkbm")]
+            Self::Vkbm(kbm) => kbm.cursor(),
         }
     }
 }
@@ -261,6 +272,61 @@ fn warn_once_if_elevation_mismatch(game: &GameWindow) {
     }
 }
 
+/// Builds the actuator for `run`: the real backend, or the log-only
+/// rehearsal one under `--dry-run`.
+fn build_kbm(cfg: &Config, dry_run: bool, game: GameWindow) -> anyhow::Result<AnyKbm> {
+    if dry_run {
+        return Ok(AnyKbm::Dry { require_foreground: cfg.require_foreground, game });
+    }
+    if cfg.backend.kind == BackendKind::Serial {
+        #[cfg(feature = "serial")]
+        {
+            let serial = cfg.backend.serial.as_ref().context("backend.serial missing")?;
+            return Ok(AnyKbm::Serial(
+                SerialKbm::new(
+                    &serial.port,
+                    serial.baud,
+                    cfg.require_foreground,
+                    cfg.focus_if_needed,
+                    game.clone(),
+                )
+                .context("serial link init failed")?,
+            ));
+        }
+        #[cfg(not(feature = "serial"))]
+        bail!(
+            "backend.kind = \"serial\" needs a build with --features serial (validate should have \
+             caught this)"
+        );
+    }
+    if cfg.backend.kind == BackendKind::Vkbm {
+        #[cfg(feature = "vkbm")]
+        {
+            let vkbm = cfg.backend.vkbm.clone().unwrap_or_default();
+            return Ok(AnyKbm::Vkbm(
+                VkbmKbm::new(
+                    vkbm.vid,
+                    vkbm.pid,
+                    vkbm.ack_timeout_ms,
+                    cfg.require_foreground,
+                    cfg.focus_if_needed,
+                    game.clone(),
+                )
+                .context("vkbm link init failed")?,
+            ));
+        }
+        #[cfg(not(feature = "vkbm"))]
+        bail!(
+            "backend.kind = \"vkbm\" needs a build with --features vkbm (validate should have \
+             caught this)"
+        );
+    }
+    Ok(AnyKbm::Live(
+        SendInputKbm::new(cfg.require_foreground, cfg.focus_if_needed, game)
+            .context("enigo init failed")?,
+    ))
+}
+
 fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
     cfg.validate()?;
     // Single-instance guard: two live processes would both actuate on the
@@ -273,34 +339,7 @@ fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
     let kill = Hotkey::parse(&cfg.kill_hotkey)
         .map_err(anyhow::Error::msg)
         .context("kill_hotkey (emergency stop) is invalid")?;
-    let kbm = if dry_run {
-        AnyKbm::Dry { require_foreground: cfg.require_foreground, game }
-    } else if cfg.backend.kind == BackendKind::Serial {
-        #[cfg(feature = "serial")]
-        {
-            let serial = cfg.backend.serial.as_ref().context("backend.serial missing")?;
-            AnyKbm::Serial(
-                SerialKbm::new(
-                    &serial.port,
-                    serial.baud,
-                    cfg.require_foreground,
-                    cfg.focus_if_needed,
-                    game.clone(),
-                )
-                .context("serial link init failed")?,
-            )
-        }
-        #[cfg(not(feature = "serial"))]
-        bail!(
-            "backend.kind = \"serial\" needs a build with --features serial (validate should have \
-             caught this)"
-        );
-    } else {
-        AnyKbm::Live(
-            SendInputKbm::new(cfg.require_foreground, cfg.focus_if_needed, game)
-                .context("enigo init failed")?,
-        )
-    };
+    let kbm = build_kbm(cfg, dry_run, game)?;
     // validate() pinned [abort_key] to "escape"; mapping the config value
     // here keeps the config the single source of truth for what the core
     // sends.
@@ -318,6 +357,8 @@ fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
             AnyKbm::Live(_) => "sendinput",
             #[cfg(feature = "serial")]
             AnyKbm::Serial(_) => "serial",
+            #[cfg(feature = "vkbm")]
+            AnyKbm::Vkbm(_) => "vkbm",
             AnyKbm::Dry { .. } => "dry-run",
         }
     };
@@ -604,6 +645,28 @@ fn doctor_smoke(cfg: &Config, smoke: bool) -> anyhow::Result<usize> {
             return Ok(0);
         }
         #[cfg(not(feature = "serial"))]
+        return Ok(0); // validate() already refused this combination
+    }
+    if cfg.backend.kind == BackendKind::Vkbm {
+        // A vkbm build's smoke test is the handshake (ping + info + protocol
+        // check) plus a dry-run echo round-trip: the device runs its full
+        // command path while actuating nothing.
+        #[cfg(feature = "vkbm")]
+        {
+            let vkbm = cfg.backend.vkbm.clone().unwrap_or_default();
+            let mut kbm = VkbmKbm::new(
+                vkbm.vid,
+                vkbm.pid,
+                vkbm.ack_timeout_ms,
+                cfg.require_foreground,
+                cfg.focus_if_needed,
+                GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref()),
+            )
+            .context("smoke: vkbm handshake failed")?;
+            kbm.smoke_echo().context("smoke: vkbm dry-run echo failed")?;
+            return Ok(0);
+        }
+        #[cfg(not(feature = "vkbm"))]
         return Ok(0); // validate() already refused this combination
     }
     let mut kbm = SendInputKbm::new(

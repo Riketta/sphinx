@@ -26,11 +26,15 @@ default = []
 # v2 hardware input (PLAN §8): UART -> HID dongle / MCU backend. Off by
 # default so the default build has no serial dependency.
 serial = ["dep:serialport"]
+# versa-kbm RP2040 hardware input (PLAN §11.4): HID vendor control channel.
+# Off by default so the default build has no hidapi dependency.
+vkbm = ["dep:hidapi"]
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 enigo = "0.6"
+hidapi = { version = "2", optional = true }
 serialport = { version = "4", optional = true }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

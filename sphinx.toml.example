@@ -30,10 +30,20 @@ confirm = { x = 285, y = 315 }
 key = "escape"         # v1 supports "escape" only (BuyDialog cancel path)
 
 [backend]
-kind = "sendinput"     # "sendinput" (default) or "serial" (build with --features serial)
+# "sendinput" (default), "serial" (build with --features serial), or "vkbm"
+# (versa-kbm RP2040 dongle, build with --features vkbm).
+kind = "sendinput"
 # Game discovery matches these image names (case-insensitive). Defaults:
 # wowb.exe, wow.exe, wowclassic.exe, wow-64.exe. Override only if yours differs:
 # window = { process_names = ["wowb.exe"] }
 # With several clients open, pin discovery to the right window (title substring,
 # case-insensitive). Without it, the largest visible client wins:
 # window = { title_filter = "World of Warcraft" }
+
+# versa-kbm backend (kind = "vkbm", --features vkbm). Every key defaults, so
+# the bare kind works; the table is optional. The board must be armed (solid
+# blue LED) for actuation - BOOTSEL toggles the hardware switch.
+# [backend.vkbm]
+# vid = 0x258a           # USB vendor id to scan for (firmware default)
+# pid = 0x0100           # USB product id to scan for (firmware default)
+# ack_timeout_ms = 250   # per-attempt ack deadline; a lost ack is resent once

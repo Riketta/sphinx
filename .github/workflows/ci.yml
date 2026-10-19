@@ -44,11 +44,20 @@ jobs:
       - name: "Clippy (serial feature: v2 hardware backend)"
         run: cargo clippy --all-targets --features serial --locked -- -D warnings
 
+      - name: "Clippy (vkbm feature: versa-kbm hardware backend)"
+        run: cargo clippy --all-targets --features vkbm --locked -- -D warnings
+
+      - name: "Clippy (all features)"
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
       - name: Tests (core state machine with fake ports)
         run: cargo test --locked
 
       - name: Tests (serial protocol ack/retry)
         run: cargo test --features serial --locked
+
+      - name: Tests (vkbm protocol ack/retry)
+        run: cargo test --features vkbm --locked
 
       - name: Build
         run: cargo build --locked

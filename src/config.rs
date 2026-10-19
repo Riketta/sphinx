@@ -64,6 +64,21 @@ fn d_process_names() -> Vec<String> {
     DEFAULT_PROCESS_NAMES.iter().map(|s| (*s).to_string()).collect()
 }
 
+/// vkbm backend default USB vendor id (firmware default).
+fn d_vkbm_vid() -> u16 {
+    0x258a
+}
+
+/// vkbm backend default USB product id (firmware default).
+fn d_vkbm_pid() -> u16 {
+    0x0100
+}
+
+/// vkbm backend default per-attempt ack deadline (the vkbm CLI default).
+fn d_vkbm_ack_timeout_ms() -> u64 {
+    250
+}
+
 /// A client-area physical pixel point (§3.7).
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -123,6 +138,10 @@ pub struct Backend {
     /// `serial`-backend extras (reserved for §8).
     #[serde(default)]
     pub serial: Option<SerialBackend>,
+    /// `vkbm`-backend extras (versa-kbm RP2040, §11.4). Everything defaults,
+    /// so the table itself is optional.
+    #[serde(default)]
+    pub vkbm: Option<VkbmBackend>,
 }
 
 /// Actuator kind.
@@ -136,6 +155,8 @@ pub enum BackendKind {
     Window,
     /// UART -> HID dongle / MCU (§8, v2).
     Serial,
+    /// versa-kbm RP2040 hardware input over the HID vendor channel (§11.4).
+    Vkbm,
 }
 
 /// Window-backend settings (§5.4b).
@@ -160,6 +181,28 @@ pub struct SerialBackend {
     pub port: String,
     /// Line baud rate.
     pub baud: u32,
+}
+
+/// vkbm-backend settings (§11.4): the versa-kbm RP2040 dongle.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VkbmBackend {
+    /// USB vendor id to scan for.
+    #[serde(default = "d_vkbm_vid")]
+    pub vid: u16,
+    /// USB product id to scan for.
+    #[serde(default = "d_vkbm_pid")]
+    pub pid: u16,
+    /// Per-attempt ack deadline in ms; a lost ack is resent once (the device
+    /// dedups by sequence number, so the resend cannot execute twice).
+    #[serde(default = "d_vkbm_ack_timeout_ms")]
+    pub ack_timeout_ms: u64,
+}
+
+impl Default for VkbmBackend {
+    fn default() -> Self {
+        Self { vid: d_vkbm_vid(), pid: d_vkbm_pid(), ack_timeout_ms: d_vkbm_ack_timeout_ms() }
+    }
 }
 
 /// Calibration reference dumped by `/am semaphore coords`; sphinx never
@@ -335,6 +378,21 @@ impl Config {
                    never find anything"
             );
         }
+        self.validate_backend_kind()?;
+        if let Some(screen) = &self.screen {
+            if screen.width <= 0 || screen.height <= 0 {
+                bail!("screen width/height must be positive");
+            }
+        }
+        Ok(())
+    }
+
+    /// Backend-kind specific validation (§5.4/§8/§11.4): unsupported kinds
+    /// and kinds whose feature/table is missing fail here, at startup.
+    ///
+    /// # Errors
+    /// Unsupported or unbuildable backend selections.
+    fn validate_backend_kind(&self) -> anyhow::Result<()> {
         match self.backend.kind {
             BackendKind::Sendinput => {}
             BackendKind::Window => {
@@ -350,7 +408,8 @@ impl Config {
                         .map(|s| format!(" (port {} @ {} baud configured)", s.port, s.baud))
                         .unwrap_or_default();
                     bail!(
-                        "backend.kind = \"serial\" is v2 hardware input; rebuild with --features serial{detail}"
+                        "backend.kind = \"serial\" is v2 hardware input; rebuild with --features \
+                         serial{detail}"
                     );
                 }
                 #[cfg(feature = "serial")]
@@ -367,10 +426,31 @@ impl Config {
                     }
                 }
             }
-        }
-        if let Some(screen) = &self.screen {
-            if screen.width <= 0 || screen.height <= 0 {
-                bail!("screen width/height must be positive");
+            BackendKind::Vkbm => {
+                #[cfg(not(feature = "vkbm"))]
+                {
+                    let detail = self
+                        .backend
+                        .vkbm
+                        .as_ref()
+                        .map(|v| {
+                            format!(
+                                " (vid {:#06x}, pid {:#06x}, ack_timeout_ms {} configured)",
+                                v.vid, v.pid, v.ack_timeout_ms
+                            )
+                        })
+                        .unwrap_or_default();
+                    bail!(
+                        "backend.kind = \"vkbm\" is versa-kbm hardware input (PLAN §11.4); \
+                         rebuild with --features vkbm{detail}"
+                    );
+                }
+                #[cfg(feature = "vkbm")]
+                if let Some(v) = self.backend.vkbm.as_ref() {
+                    if !(10..=2000).contains(&v.ack_timeout_ms) {
+                        bail!("backend.vkbm.ack_timeout_ms {} outside 10..=2000", v.ack_timeout_ms);
+                    }
+                }
             }
         }
         Ok(())
@@ -379,6 +459,8 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "vkbm")]
+    use super::VkbmBackend;
     use super::{
         BackendKind,
         Config,
@@ -524,5 +606,38 @@ mod tests {
     #[test]
     fn validate_rejects_serial_kind_without_the_feature() {
         assert!(validated(|cfg| cfg.backend.kind = BackendKind::Serial).is_err());
+    }
+
+    #[cfg(feature = "vkbm")]
+    #[test]
+    fn validate_accepts_vkbm_kind_without_table() {
+        // Everything in [backend.vkbm] defaults, so the bare kind is valid.
+        assert!(validated(|cfg| cfg.backend.kind = BackendKind::Vkbm).is_ok());
+    }
+
+    #[cfg(feature = "vkbm")]
+    #[test]
+    fn validate_rejects_vkbm_ack_timeout_out_of_range() {
+        assert!(validated(|cfg| {
+            cfg.backend.kind = BackendKind::Vkbm;
+            cfg.backend.vkbm = Some(VkbmBackend { ack_timeout_ms: 9, ..VkbmBackend::default() });
+        })
+        .is_err());
+        assert!(validated(|cfg| {
+            cfg.backend.kind = BackendKind::Vkbm;
+            cfg.backend.vkbm = Some(VkbmBackend { ack_timeout_ms: 2001, ..VkbmBackend::default() });
+        })
+        .is_err());
+        assert!(validated(|cfg| {
+            cfg.backend.kind = BackendKind::Vkbm;
+            cfg.backend.vkbm = Some(VkbmBackend::default());
+        })
+        .is_ok());
+    }
+
+    #[cfg(not(feature = "vkbm"))]
+    #[test]
+    fn validate_rejects_vkbm_kind_without_the_feature() {
+        assert!(validated(|cfg| cfg.backend.kind = BackendKind::Vkbm).is_err());
     }
 }

@@ -7,7 +7,11 @@ pub mod guard;
 pub mod sendinput;
 #[cfg(feature = "serial")]
 pub mod serial;
+#[cfg(feature = "vkbm")]
+pub mod vkbm;
 
 pub use sendinput::SendInputKbm;
 #[cfg(feature = "serial")]
 pub use serial::SerialKbm;
+#[cfg(feature = "vkbm")]
+pub use vkbm::VkbmKbm;
