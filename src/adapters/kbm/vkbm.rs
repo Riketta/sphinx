@@ -16,8 +16,11 @@
 //! Coordinates are screen pixels translated by the shared [`ActuationGuard`]
 //! like every other backend; the screen point is then mapped endpoint-exact
 //! onto the HID absolute range (`0..=32767`), which the OS scales across
-//! the primary monitor - a single/primary-monitor setup, the same caveat
-//! the sendinput backend documents for enigo's absolute moves.
+//! the primary monitor. That mapping is a hardware property - Windows
+//! normalizes absolute HID mice to the primary display, so the backend
+//! refuses targets outside it instead of letting the clamp land the click
+//! somewhere random on the primary (multi-monitor needs the planned
+//! closed-loop relative mode).
 
 use std::{
     fmt,
@@ -556,6 +559,13 @@ fn to_abs(v: i32, dim: i32) -> u16 {
     u16::try_from(scaled).unwrap_or(ABS_MAX)
 }
 
+/// Whether a screen point lies on the primary monitor - the only surface
+/// the OS scales HID absolute reports across.
+#[must_use]
+fn point_in_primary(p: (i32, i32), primary: (i32, i32)) -> bool {
+    p.0 >= 0 && p.0 < primary.0 && p.1 >= 0 && p.1 < primary.1
+}
+
 /// Interprets an actuation outcome: `Ok` and dry-run `Echo` are both
 /// success; a lost ack is logged loudly but never retried (the dedup keeps
 /// a resent frame from executing twice, so a retry could only double-send).
@@ -706,6 +716,20 @@ impl Kbm for VkbmKbm {
         if !self.guard.still_prepared("vkbm press") {
             return;
         }
+        // HID absolute reports are normalized across the primary monitor
+        // only. A target outside it is unreachable, and sending one anyway
+        // would click wherever the clamped point lands - possibly another
+        // window. Skip instead; `doctor` reports the placement problem.
+        if !point_in_primary((sx, sy), screen_size()) {
+            warn!(
+                action = "press",
+                screen_x = sx,
+                screen_y = sy,
+                "target outside the primary monitor - the absolute HID mouse cannot reach \
+                 it; skipping (make the WoW display the primary display)"
+            );
+            return;
+        }
         let (w, h) = screen_size();
         let cmd = wire::Cmd::ClickAbs { x: to_abs(sx, w), y: to_abs(sy, h) };
         let outcome = self.client.request(cmd, self.timeout);
@@ -750,6 +774,7 @@ mod tests {
     use super::{
         initial_seq,
         issue,
+        point_in_primary,
         to_abs,
         wait_ack,
         wire,
@@ -1045,5 +1070,25 @@ mod tests {
             assert!(abs >= last, "abs must not decrease at px={px}");
             last = abs;
         }
+    }
+
+    // --- primary-monitor gate ---
+
+    #[test]
+    fn points_on_the_primary_are_reachable() {
+        assert!(point_in_primary((0, 0), (1920, 1080)));
+        assert!(point_in_primary((1919, 1079), (1920, 1080)));
+        assert!(point_in_primary((960, 540), (1920, 1080)));
+    }
+
+    #[test]
+    fn points_off_the_primary_are_refused() {
+        // A right-of-primary monitor starts at x = 1920: the second-screen
+        // case that mis-clicked before the gate existed.
+        assert!(!point_in_primary((1920, 400), (1920, 1080)));
+        assert!(!point_in_primary((2500, 700), (1920, 1080)));
+        assert!(!point_in_primary((100, 1080), (1920, 1080)));
+        assert!(!point_in_primary((-1, 5), (1920, 1080)));
+        assert!(!point_in_primary((5, -1), (1920, 1080)));
     }
 }

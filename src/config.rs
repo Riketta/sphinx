@@ -144,8 +144,8 @@ pub struct Backend {
     pub vkbm: Option<VkbmBackend>,
 }
 
-/// Actuator kind.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+/// Actuator kind. Also the vocabulary of the `--backend` CLI override.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendKind {
     /// Hardware-level input via enigo (v1 default).

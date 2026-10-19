@@ -22,12 +22,11 @@ panic = "deny"
 undocumented_unsafe_blocks = "warn"
 
 [features]
-default = []
-# v2 hardware input (PLAN §8): UART -> HID dongle / MCU backend. Off by
-# default so the default build has no serial dependency.
+# vkbm on by default: the tool's home machine runs the RP2040 board, so a
+# plain `cargo run` actuates through it. The pure build is
+# `--no-default-features`; serial stays opt-in.
+default = ["vkbm"]
 serial = ["dep:serialport"]
-# versa-kbm RP2040 hardware input (PLAN §11.4): HID vendor control channel.
-# Off by default so the default build has no hidapi dependency.
 vkbm = ["dep:hidapi"]
 
 [dependencies]

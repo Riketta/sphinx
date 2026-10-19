@@ -31,7 +31,8 @@ key = "escape"         # v1 supports "escape" only (BuyDialog cancel path)
 
 [backend]
 # "sendinput" (default), "serial" (build with --features serial), or "vkbm"
-# (versa-kbm RP2040 dongle, build with --features vkbm).
+# (versa-kbm RP2040 dongle; on by default since sphinx 0.1). Override per
+# invocation with `--backend vkbm|sendinput|serial` - it wins over this file.
 kind = "sendinput"
 # Game discovery matches these image names (case-insensitive). Defaults:
 # wowb.exe, wow.exe, wowclassic.exe, wow-64.exe. Override only if yours differs:

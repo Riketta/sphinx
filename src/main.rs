@@ -189,6 +189,10 @@ struct Cli {
     /// Path to the TOML config.
     #[arg(long, default_value = "sphinx.toml")]
     config: PathBuf,
+    /// Actuator override for this invocation (wins over the config's
+    /// [backend] kind): sendinput, serial or vkbm.
+    #[arg(long, global = true, value_enum)]
+    backend: Option<BackendKind>,
     #[command(subcommand)]
     command: Cmd,
 }
@@ -215,7 +219,11 @@ fn main() -> anyhow::Result<()> {
     init_tracing();
     ensure_dpi_awareness();
     let cli = Cli::parse();
-    let cfg = Config::load(&cli.config)?;
+    let mut cfg = Config::load(&cli.config)?;
+    if let Some(kind) = cli.backend {
+        info!(?kind, "backend overridden from the command line");
+        cfg.backend.kind = kind;
+    }
     match cli.command {
         Cmd::Run { dry_run } => run(&cfg, dry_run),
         Cmd::Calibrate => calibrate(&cfg),
@@ -446,6 +454,10 @@ fn doctor(cfg: &Config, smoke: bool) -> anyhow::Result<()> {
     doctor_ui_scale(cfg);
     failures += doctor_pixels(cfg);
     doctor_kill(cfg);
+    #[cfg(feature = "vkbm")]
+    {
+        failures += doctor_vkbm_placement(cfg);
+    }
     failures += doctor_smoke(cfg, smoke)?;
 
     if failures > 0 {
@@ -619,6 +631,52 @@ fn doctor_kill(cfg: &Config) {
             "kill: hold to exit within one poll (GetAsyncKeyState, no hook)"
         ),
         Err(e) => warn!("kill: {e}"),
+    }
+}
+
+/// Returns 1 when the game window lies outside the primary monitor: the
+/// vkbm backend's absolute HID mapping is primary-bound (Windows normalizes
+/// absolute mice to the primary display), so targets there would be skipped
+/// at actuation time. `doctor` is where that misconfiguration is diagnosed.
+#[cfg(feature = "vkbm")]
+fn doctor_vkbm_placement(cfg: &Config) -> usize {
+    if cfg.backend.kind != BackendKind::Vkbm {
+        return 0;
+    }
+    // A missing window is doctor_window's finding; placement needs one.
+    let Some(info) =
+        GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref()).find()
+    else {
+        return 0;
+    };
+    let Some((ox, oy)) = info.client_to_screen(0, 0) else {
+        warn!("vkbm placement: could not locate the game window on the desktop");
+        return 1;
+    };
+    let (w, h) = screen_size();
+    let inside = ox >= 0 && oy >= 0 && ox + info.client.0 <= w && oy + info.client.1 <= h;
+    if inside {
+        info!(
+            origin_x = ox,
+            origin_y = oy,
+            primary_width = w,
+            primary_height = h,
+            "vkbm placement: game window on the primary monitor"
+        );
+        0
+    } else {
+        warn!(
+            origin_x = ox,
+            origin_y = oy,
+            client_width = info.client.0,
+            client_height = info.client.1,
+            primary_width = w,
+            primary_height = h,
+            "vkbm placement: game window outside the primary monitor - HID absolute input \
+             cannot reach it, actuation will be skipped; make the WoW display the primary \
+             display"
+        );
+        1
     }
 }
 
