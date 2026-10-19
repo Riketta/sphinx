@@ -14,7 +14,10 @@ use std::{
         self,
         Write,
     },
-    time::Duration,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use anyhow::Context;
@@ -35,8 +38,15 @@ use crate::{
     },
 };
 
-/// How long one `OK` ack may take before the attempt counts as lost.
-const ACK_TIMEOUT: Duration = Duration::from_millis(250);
+/// How long one `OK` ack may take before the attempt counts as lost. The
+/// actuation contract budgets <=150 ms per press, so the ack window stays
+/// inside it.
+const ACK_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// Per-`read` port timeout. Bounds how long a single stalled byte can block
+/// the poll loop (and with it the kill hotkey); the overall ack window is
+/// [`ACK_TIMEOUT`], enforced in `read_ok`.
+const READ_TIMEOUT: Duration = Duration::from_millis(25);
 
 /// One command round-trip: send a line, wait for the `OK` ack. Abstracted so
 /// the ack/retry logic is testable without hardware.
@@ -60,9 +70,19 @@ impl LineLink for SerialLink {
 
     fn read_ok(&mut self) -> io::Result<()> {
         // Read one full line (CRLF/LF tolerated, bounded) and require `OK`.
+        // The overall deadline spans the whole line: per-byte port timeouts
+        // alone would let a slow-drip device stall the poll loop for
+        // bytes * port_timeout.
+        let deadline = Instant::now() + ACK_TIMEOUT;
         let mut line = Vec::new();
         let mut byte = [0u8; 1];
         loop {
+            if Instant::now() > deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "serial ack deadline exceeded",
+                ));
+            }
             self.port.read_exact(&mut byte)?;
             if byte[0] == b'\n' {
                 break;
@@ -85,9 +105,8 @@ impl LineLink for SerialLink {
     }
 }
 
-/// Sends one command line with the plan's retry: a lost ack gets exactly one
-/// resend before the command is skipped (logged by the caller's `info`/`warn`
-/// here, since this is the backend's whole observable behavior).
+/// Sends one command line with the retry policy: a lost ack on the
+/// **idempotent** ping is resent once, then the command is given up on.
 fn issue(link: &mut dyn LineLink, cmd: &str) -> io::Result<()> {
     for attempt in 0..2 {
         match link.send(cmd).and_then(|()| link.read_ok()) {
@@ -105,6 +124,26 @@ fn issue(link: &mut dyn LineLink, cmd: &str) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Sends one actuation command **exactly once**. A lost ack means the MCU
+/// may already have executed the click - resending could double it, so the
+/// command is skipped and the addon's own stage timeouts surface the gap.
+fn issue_once(link: &mut dyn LineLink, cmd: &str) -> io::Result<()> {
+    match link.send(cmd).and_then(|()| link.read_ok()) {
+        Ok(()) => {
+            info!(line = cmd.trim_end(), "serial command acked");
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                line = cmd.trim_end(),
+                "serial command lost once; skipping (no retry for actuation)"
+            );
+            Err(e)
+        }
+    }
 }
 
 /// UART-actuator behind the same [`Kbm`] port as the enigo backend.
@@ -127,12 +166,11 @@ impl SerialKbm {
         game: GameWindow,
     ) -> anyhow::Result<Self> {
         let port = serialport::new(port_name, baud)
-            .timeout(ACK_TIMEOUT)
+            .timeout(READ_TIMEOUT)
             .open()
             .with_context(|| format!("opening serial port {port_name} @ {baud}"))?;
         let mut link = SerialLink { port };
-        link.send("P\n")
-            .and_then(|()| link.read_ok())
+        issue(&mut link, "P\n")
             .with_context(|| format!("serial MCU on {port_name} did not ack the ping"))?;
         info!(port = port_name, baud, "serial link up (ping acked)");
         Ok(Self { guard: ActuationGuard::new(require_foreground, focus_if_needed, game), link })
@@ -144,7 +182,7 @@ impl Kbm for SerialKbm {
         let Some((sx, sy)) = self.guard.prepared_point("serial press", x, y) else {
             return;
         };
-        let _ = issue(&mut self.link, &format!("C {sx} {sy}\n"));
+        let _ = issue_once(&mut self.link, &format!("C {sx} {sy}\n"));
     }
 
     fn key(&mut self, key: Key) {
@@ -154,7 +192,7 @@ impl Kbm for SerialKbm {
         let code = match key {
             Key::Escape => i32::from(VK_ESCAPE),
         };
-        let _ = issue(&mut self.link, &format!("K {code}\n"));
+        let _ = issue_once(&mut self.link, &format!("K {code}\n"));
     }
 
     fn cursor(&self) -> (i32, i32) {
@@ -172,6 +210,7 @@ mod tests {
 
     use super::{
         issue,
+        issue_once,
         LineLink,
     };
 
@@ -197,18 +236,35 @@ mod tests {
     #[test]
     fn command_ok_on_first_attempt() {
         let mut link = FakeLink { acks: VecDeque::from([Ok(())]), ..FakeLink::default() };
-        issue(&mut link, "C 1011 441\n").ok();
-        assert_eq!(link.sent, vec!["C 1011 441\n".to_string()]);
+        issue(&mut link, "P\n").ok();
+        assert_eq!(link.sent, vec!["P\n".to_string()]);
     }
 
     #[test]
-    fn lost_ack_is_resent_once() {
+    fn lost_ping_ack_is_resent_once() {
+        // `P` is idempotent: a lost ack is safe to retry.
         let mut link = FakeLink {
             acks: VecDeque::from([Err(io::Error::new(io::ErrorKind::TimedOut, "slow")), Ok(())]),
             ..FakeLink::default()
         };
-        issue(&mut link, "K 27\n").ok();
-        assert_eq!(link.sent, vec!["K 27\n".to_string(), "K 27\n".to_string()]);
+        issue(&mut link, "P\n").ok();
+        assert_eq!(link.sent, vec!["P\n".to_string(), "P\n".to_string()]);
+    }
+
+    #[test]
+    fn lost_actuation_ack_is_never_resent() {
+        // The MCU may already have executed the click when the ack is lost:
+        // resending `C` could double-click a buy button.
+        let mut link = FakeLink {
+            acks: VecDeque::from([Err(io::Error::new(io::ErrorKind::TimedOut, "slow"))]),
+            ..FakeLink::default()
+        };
+        issue_once(&mut link, "C 1011 441\n").ok();
+        assert_eq!(
+            link.sent,
+            vec!["C 1011 441\n".to_string()],
+            "exactly one send - no retry for actuation"
+        );
     }
 
     #[test]
@@ -218,7 +274,7 @@ mod tests {
             acks: VecDeque::from([Err(timeout()), Err(timeout())]),
             ..FakeLink::default()
         };
-        let result = issue(&mut link, "K 27\n");
+        let result = issue(&mut link, "P\n");
         assert!(result.is_err());
         assert_eq!(link.sent.len(), 2, "exactly one resend, then give up");
     }

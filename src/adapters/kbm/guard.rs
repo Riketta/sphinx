@@ -71,4 +71,26 @@ impl ActuationGuard {
     pub fn prepared_key(&mut self, action: &str) -> bool {
         self.prepared(action).is_some()
     }
+
+    /// Re-checks the policy right before the actual input lands, shrinking
+    /// the alt-tab race between discovery and actuation (TOCTOU): the click
+    /// must never land in whatever window took focus in between.
+    pub fn still_prepared(&mut self, action: &str) -> bool {
+        let Some(info) = self.game.find() else {
+            warn!(action, "WoW window vanished; skipping");
+            return false;
+        };
+        if !self.require_foreground {
+            return true;
+        }
+        if foreground_hwnd().is_some_and(|fg| same_window(fg, info.hwnd)) {
+            return true;
+        }
+        warn!(
+            action,
+            "WoW lost foreground between check and click; skipping (refusing to click into \
+             another window)"
+        );
+        false
+    }
 }

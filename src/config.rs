@@ -66,6 +66,7 @@ fn d_process_names() -> Vec<String> {
 
 /// A client-area physical pixel point (§3.7).
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Point {
     /// Horizontal client pixel.
     pub x: i32,
@@ -73,33 +74,20 @@ pub struct Point {
     pub y: i32,
 }
 
-/// Semaphore pixel points, from `/am semaphore coords`.
+/// Semaphore pixel points, from `/am semaphore coords`. Required: a stale
+/// default would sample the wrong pixels silently.
 #[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PixelPoints {
     /// CMD pixel.
-    #[serde(default = "d_cmd")]
     pub cmd: Point,
     /// STROBE pixel.
-    #[serde(default = "d_strobe")]
     pub strobe: Point,
-}
-
-impl Default for PixelPoints {
-    fn default() -> Self {
-        Self { cmd: d_cmd(), strobe: d_strobe() }
-    }
-}
-
-fn d_cmd() -> Point {
-    Point { x: 8, y: 8 }
-}
-
-fn d_strobe() -> Point {
-    Point { x: 8, y: 16 }
 }
 
 /// Target button points, from `/am semaphore coords`.
 #[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TargetPoints {
     /// `CommoditiesBuyFrame` `BuyButton`.
     pub buyout: Point,
@@ -109,6 +97,7 @@ pub struct TargetPoints {
 
 /// ABORT actuation key settings.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AbortKey {
     /// Key name sphinx sends on ABORT (v1: `"escape"` only).
     #[serde(default = "d_escape")]
@@ -123,6 +112,7 @@ impl Default for AbortKey {
 
 /// Backend selection (§5.4/§5.5).
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Backend {
     /// Which actuator to use.
     #[serde(default)]
@@ -150,14 +140,21 @@ pub enum BackendKind {
 
 /// Window-backend settings (§5.4b).
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WindowBackend {
     /// Game process image names to discover, case-insensitive.
     #[serde(default = "d_process_names")]
     pub process_names: Vec<String>,
+    /// Pin discovery to windows whose title contains this substring
+    /// (case-insensitive). Use when several clients are open; without it,
+    /// the largest visible client wins.
+    #[serde(default)]
+    pub title_filter: Option<String>,
 }
 
 /// Serial-backend settings (§8).
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SerialBackend {
     /// COM port of the dongle/MCU.
     pub port: String,
@@ -168,6 +165,7 @@ pub struct SerialBackend {
 /// Calibration reference dumped by `/am semaphore coords`; sphinx never
 /// derives coordinates from it, but `doctor` compares the live desktop.
 #[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScreenRef {
     /// Physical desktop width.
     pub width: i32,
@@ -203,8 +201,7 @@ pub struct Config {
     /// Burst guard: rolling per-minute actuation ceiling (>= 1).
     #[serde(default = "d_max_per_min")]
     pub max_actuations_per_min: u32,
-    /// Semaphore pixel points.
-    #[serde(default)]
+    /// Semaphore pixel points (required — no safe default exists).
     pub pixels: PixelPoints,
     /// Target button points (required — no safe default exists).
     pub targets: TargetPoints,
@@ -243,6 +240,16 @@ impl Config {
         self.backend.window.as_ref().map_or_else(d_process_names, |w| w.process_names.clone())
     }
 
+    /// Optional title-substring filter for game-window discovery
+    /// (case-insensitive; `None` unless configured non-empty).
+    pub fn window_title_filter(&self) -> Option<String> {
+        self.backend
+            .window
+            .as_ref()
+            .and_then(|w| w.title_filter.clone())
+            .filter(|t| !t.trim().is_empty())
+    }
+
     /// Cross-field validation; also parses the kill hotkey and abort key so
     /// bad values fail at startup, never mid-session.
     ///
@@ -265,6 +272,14 @@ impl Config {
         if self.watchdog_ms < 2 * self.poll_ms {
             bail!("watchdog_ms {} must be >= 2x poll_ms {}", self.watchdog_ms, self.poll_ms);
         }
+        if self.debounce_ms >= self.watchdog_ms {
+            bail!(
+                "debounce_ms {} must be < watchdog_ms {} (else every edge dies in the watchdog \
+                 before the debounce window can close and nothing ever actuates)",
+                self.debounce_ms,
+                self.watchdog_ms
+            );
+        }
         if self.min_actuation_interval_ms > 60_000 {
             bail!(
                 "min_actuation_interval_ms {} > 60_000 (that disables the sniper, not bursts)",
@@ -277,7 +292,9 @@ impl Config {
         Hotkey::parse(&self.kill_hotkey).map_err(|e| {
             anyhow::anyhow!("kill_hotkey {e} (this is your emergency stop - fix it)")
         })?;
-        match key_code(&self.abort_key.key) {
+        // Case-insensitive like the kill hotkey parser: `"Escape"` must not
+        // fail where `"escape"` works.
+        match key_code(&self.abort_key.key.to_lowercase()) {
             None => bail!("abort_key.key {:?} is not a known key name", self.abort_key.key),
             Some(vk) if vk == VK_ESCAPE => {}
             Some(_) => bail!("abort_key: v1 supports only \"escape\""),
@@ -326,30 +343,64 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{
+        BackendKind,
+        Config,
+        ScreenRef,
+    };
+
+    /// Full valid config used as the base for `validate` mutation tests.
+    const VALID: &str = "[pixels]\ncmd = { x = 7, y = 7 }\nstrobe = { x = 7, y = 15 }\n\
+         [targets]\nbuyout = { x = 304, y = 434 }\nconfirm = { x = 285, y = 315 }\n";
 
     fn parse(toml: &str) -> Result<Config, String> {
         toml::from_str(toml).map_err(|e| e.to_string())
     }
 
+    /// Parses [`VALID`], applies `mutate`, then validates.
+    fn validated(mutate: impl FnOnce(&mut Config)) -> Result<(), String> {
+        let mut cfg = parse(VALID)?;
+        mutate(&mut cfg);
+        cfg.validate().map_err(|e| e.to_string())
+    }
+
     #[test]
-    fn minimal_config_needs_only_targets() -> Result<(), String> {
-        let cfg =
-            parse("[targets]\nbuyout  = { x = 304, y = 434 }\nconfirm = { x = 285, y = 315 }\n")?;
+    fn minimal_config_needs_pixels_and_targets() -> Result<(), String> {
+        let cfg = parse(VALID)?;
         assert_eq!(cfg.poll_ms, 50);
         assert_eq!(cfg.kill_hotkey, "ctrl+alt+f12");
         assert!(cfg.require_foreground);
         assert!(!cfg.focus_if_needed);
         assert_eq!(cfg.abort_key.key, "escape");
+        assert_eq!(cfg.pixels.cmd, super::Point { x: 7, y: 7 });
         assert!(cfg.screen.is_none());
         Ok(())
     }
 
     #[test]
     fn unknown_fields_are_rejected() {
-        let cfg =
-            parse("nope = 1\n[targets]\nbuyout = { x = 1, y = 2 }\nconfirm = { x = 3, y = 4 }\n");
+        let cfg = parse(
+            "nope = 1\n[pixels]\ncmd = { x = 1, y = 2 }\nstrobe = { x = 3, y = 4 }\n\
+             [targets]\nbuyout = { x = 1, y = 2 }\nconfirm = { x = 3, y = 4 }\n",
+        );
         assert!(cfg.is_err());
+    }
+
+    #[test]
+    fn missing_pixels_table_is_rejected() {
+        // `[pixels]` is required: silent stale defaults would sample the
+        // wrong pixels.
+        assert!(
+            parse("[targets]\nbuyout = { x = 1, y = 2 }\nconfirm = { x = 3, y = 4 }\n").is_err()
+        );
+    }
+
+    #[test]
+    fn unknown_fields_in_nested_tables_are_rejected() {
+        let pixels = "[pixels]\ncmd = { x = 1, y = 2 }\nstrobe = { x = 3, y = 4 }\n";
+        let targets = "[targets]\nbuyout = { x = 1, y = 2 }\nconfirm = { x = 3, y = 4 }\n";
+        assert!(parse(&format!("{pixels}cmdx = {{ x = 1, y = 2 }}\n{targets}")).is_err());
+        assert!(parse(&format!("{pixels}{targets}[backend]\nkindd = \"serial\"\n")).is_err());
     }
 
     #[test]
@@ -357,11 +408,60 @@ mod tests {
         // Guards the TOML table trap: `screen`/`ui_scale` are top-level keys
         // and must not be swallowed by whatever [section] precedes them.
         let cfg = parse(
-            "screen = { width = 1920, height = 1080 }\nui_scale = 0.65\n[targets]\nbuyout = \
-             { x = 1, y = 2 }\nconfirm = { x = 3, y = 4 }\n",
+            "screen = { width = 1920, height = 1080 }\nui_scale = 0.65\n[pixels]\ncmd = \
+             { x = 1, y = 2 }\nstrobe = { x = 3, y = 4 }\n[targets]\nbuyout = { x = 1, y = 2 }\
+             \nconfirm = { x = 3, y = 4 }\n",
         )?;
         assert_eq!(cfg.screen.map(|s| (s.width, s.height)), Some((1920, 1080)));
         assert_eq!(cfg.ui_scale, Some(0.65));
         Ok(())
+    }
+
+    #[test]
+    fn validate_accepts_the_example_config() -> Result<(), String> {
+        parse(VALID)?.validate().map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn validate_rejects_debounce_not_below_watchdog() {
+        // debounce >= watchdog means every edge dies in the watchdog before
+        // the debounce window can close: nothing would ever actuate.
+        assert!(validated(|cfg| cfg.debounce_ms = cfg.watchdog_ms).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_values() {
+        assert!(validated(|cfg| cfg.poll_ms = 4).is_err());
+        assert!(validated(|cfg| cfg.poll_ms = 1001).is_err());
+        assert!(validated(|cfg| cfg.debounce_ms = 0).is_err());
+        assert!(validated(|cfg| cfg.watchdog_ms = 99).is_err()); // < 2x poll_ms (100)
+        assert!(validated(|cfg| cfg.min_actuation_interval_ms = 60_001).is_err());
+        assert!(validated(|cfg| cfg.max_actuations_per_min = 0).is_err());
+        assert!(validated(|cfg| cfg.max_actuations_per_min = 601).is_err());
+        assert!(validated(|cfg| cfg.screen = Some(ScreenRef { width: 0, height: 1080 })).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_bad_hotkeys_and_abort_keys() {
+        assert!(validated(|cfg| cfg.kill_hotkey = "ctrl+".to_string()).is_err());
+        assert!(validated(|cfg| cfg.kill_hotkey = "ctrl+f25".to_string()).is_err());
+        // Known but unsupported (v1 pins escape)...
+        assert!(validated(|cfg| cfg.abort_key.key = "f5".to_string()).is_err());
+        // ...unknown...
+        assert!(validated(|cfg| cfg.abort_key.key = "nope".to_string()).is_err());
+        // ...and wrongly cased must still work.
+        assert!(validated(|cfg| cfg.abort_key.key = "Escape".to_string()).is_ok());
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn validate_rejects_serial_without_table() {
+        assert!(validated(|cfg| cfg.backend.kind = BackendKind::Serial).is_err());
+    }
+
+    #[cfg(not(feature = "serial"))]
+    #[test]
+    fn validate_rejects_serial_kind_without_the_feature() {
+        assert!(validated(|cfg| cfg.backend.kind = BackendKind::Serial).is_err());
     }
 }

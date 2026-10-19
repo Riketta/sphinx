@@ -22,9 +22,11 @@ that exits the process immediately.
 2. In WoW: `/am semaphore coords`, paste the printed points into
    `[pixels]` / `[targets]`. Re-run after any window resize (window
    *movement* is fine — points resolve against the live client rect).
-3. `cargo run -- doctor` — environment checks (DPI, window, screen DC,
-   sampled pixels, foreground, hotkey). `--smoke` adds a pointer move
-   test on request.
+3. `cargo run -- doctor` — environment checks (DPI, window, screen, points
+   inside the client rect, sampled pixels, foreground, hotkey, elevation).
+   Off conditions (screen mismatch, misaligned points, elevated game with a
+   non-elevated sphinx) fail the run. `--smoke` adds a pointer move test on
+   request.
 4. `cargo run -- calibrate` — live 1 Hz samples of all four points while
    you compare against `/am semaphore status`.
 5. `cargo run -- run` — main loop. `--dry-run` logs actions without
@@ -44,9 +46,14 @@ that exits the process immediately.
   with fake ports (edge detection, debounce, watchdog, kill, re-verify).
 - `src/ports/` — `SemaphoreReader`, `ControlInput`, `Kbm` traits.
 - `src/adapters/` — Win32 pixel reader (`GetPixel`), polled hotkey
-  (`GetAsyncKeyState`, no hook), `sendinput` backend (enigo). The
-  `window`-message and `serial` backends implement the same `Kbm` port
-  later (PLAN §5.4/§8).
+  (`GetAsyncKeyState`, no hook), `sendinput` backend (enigo). The `serial`
+  backend (UART → HID dongle/MCU, PLAN §8) implements the same `Kbm` port
+  behind `--features serial`; the `window`-message backend is planned
+  (§5.4b).
+
+With several game clients open, pin discovery to the right window via
+`[backend.window] title_filter = "<title substring>"` (case-insensitive);
+without it, the largest visible client wins.
 
 Gates: `cargo +nightly fmt --all --check`, `cargo clippy --all-targets -- -D
 warnings`, `cargo test` (see `.github/workflows/ci.yml`).

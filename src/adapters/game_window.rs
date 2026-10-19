@@ -14,12 +14,26 @@ use windows::Win32::{
         RECT,
     },
     Graphics::Gdi::ClientToScreen,
-    System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot,
-        Process32FirstW,
-        Process32NextW,
-        PROCESSENTRY32W,
-        TH32CS_SNAPPROCESS,
+    Security::{
+        GetTokenInformation,
+        TokenElevation,
+        TOKEN_ELEVATION,
+        TOKEN_QUERY,
+    },
+    System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot,
+            Process32FirstW,
+            Process32NextW,
+            PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
+        Threading::{
+            GetCurrentProcess,
+            OpenProcess,
+            OpenProcessToken,
+            PROCESS_QUERY_LIMITED_INFORMATION,
+        },
     },
     UI::{
         HiDpi::{
@@ -79,23 +93,29 @@ impl GameWindowInfo {
 #[derive(Clone)]
 pub struct GameWindow {
     process_names: Vec<String>,
+    title_filter: Option<String>,
 }
 
 impl GameWindow {
-    /// Configures discovery with lowercase-insensitive image names
-    /// (e.g. `wow.exe`). See [`DEFAULT_PROCESS_NAMES`].
-    pub fn new(process_names: &[String]) -> Self {
-        Self { process_names: process_names.to_vec() }
+    /// Configures discovery with case-insensitive image names (e.g.
+    /// `wow.exe`) and an optional title-substring filter. See
+    /// [`DEFAULT_PROCESS_NAMES`].
+    pub fn new(process_names: &[String], title_filter: Option<&str>) -> Self {
+        Self {
+            process_names: process_names.to_vec(),
+            title_filter: title_filter.map(str::to_string),
+        }
     }
 
     /// Finds the game's main window: the visible top-level window with the
-    /// largest client area among all processes matching the name list.
+    /// largest client area among all processes matching the name list (and
+    /// the title filter, when configured).
     pub fn find(&self) -> Option<GameWindowInfo> {
         let pids = find_pids(&self.process_names);
         if pids.is_empty() {
             return None;
         }
-        let hwnd = largest_visible_window(&pids)?;
+        let hwnd = largest_visible_window(&pids, self.title_filter.as_deref())?;
         let mut pid = 0;
         // SAFETY: out-param is a local; hwnd came from EnumWindows above.
         unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
@@ -266,6 +286,8 @@ fn exe_name(raw: &[u16; 260]) -> String {
 
 struct EnumCtx<'a> {
     pids: &'a [u32],
+    /// Lowercased title-substring filter; `None` matches everything.
+    title: Option<String>,
     hits: Vec<(HWND, i64)>,
 }
 
@@ -285,6 +307,12 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
         return true.into();
     }
+    if let Some(want) = &ctx.title {
+        // Candidate windows are few: a title read per hit is cheap.
+        if !window_title(hwnd).to_lowercase().contains(want.as_str()) {
+            return true.into();
+        }
+    }
     if let Some((w, h)) = client_size(hwnd) {
         let area = i64::from(w) * i64::from(h);
         if area > 0 {
@@ -294,8 +322,8 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     true.into()
 }
 
-fn largest_visible_window(pids: &[u32]) -> Option<HWND> {
-    let mut ctx = EnumCtx { pids, hits: Vec::new() };
+fn largest_visible_window(pids: &[u32], title_filter: Option<&str>) -> Option<HWND> {
+    let mut ctx = EnumCtx { pids, title: title_filter.map(str::to_lowercase), hits: Vec::new() };
     let lparam = LPARAM(&raw mut ctx as isize);
     // SAFETY: ctx outlives the call; the callback only appends to ctx.hits.
     unsafe {
@@ -310,4 +338,50 @@ fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
     // SAFETY: out-param is a local RECT.
     unsafe { GetClientRect(hwnd, &raw mut rect) }.ok()?;
     Some((rect.right - rect.left, rect.bottom - rect.top))
+}
+
+/// Whether the process `pid` runs elevated (admin). `None` when the token
+/// cannot be queried (process gone, or access refused).
+pub fn process_elevated(pid: u32) -> Option<bool> {
+    // SAFETY: read-only query with limited rights on a live pid.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let elevated = token_elevated(process);
+    // SAFETY: closing the process handle we opened above.
+    unsafe {
+        let _ = CloseHandle(process);
+    }
+    elevated
+}
+
+/// Whether sphinx itself runs elevated.
+pub fn self_elevated() -> Option<bool> {
+    // SAFETY: GetCurrentProcess returns a pseudo handle that must not (and
+    // cannot meaningfully) be closed.
+    token_elevated(unsafe { GetCurrentProcess() })
+}
+
+/// Queries `TokenElevation` for a process (or pseudo-handle) token.
+fn token_elevated(process: HANDLE) -> Option<bool> {
+    let mut token = HANDLE::default();
+    // SAFETY: out-param is a local; the input is a process/pseudo handle.
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) }.ok()?;
+    let mut out = TOKEN_ELEVATION::default();
+    let mut returned = 0u32;
+    // SAFETY: out buffer is sized exactly for TOKEN_ELEVATION; token is
+    // closed below on every path.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&raw mut out).cast()),
+            u32::try_from(std::mem::size_of::<TOKEN_ELEVATION>()).unwrap_or(0),
+            &raw mut returned,
+        )
+    }
+    .is_ok();
+    // SAFETY: closing the token handle we opened above.
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+    ok.then_some(out.TokenIsElevated != 0)
 }

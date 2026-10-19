@@ -12,6 +12,7 @@ use windows::Win32::Graphics::Gdi::{
     GetDC,
     GetPixel,
     ReleaseDC,
+    HDC,
 };
 
 use crate::{
@@ -29,6 +30,35 @@ use crate::{
 /// client restart needs a re-find).
 const REFRESH_AFTER: Duration = Duration::from_secs(2);
 
+/// How often a re-find may be attempted while the game stays missing (the
+/// process snapshot + `EnumWindows` scan is too costly for 20 Hz polling).
+const RETRY_FIND_AFTER: Duration = Duration::from_millis(250);
+
+/// Screen DC held for the reader's lifetime; per-sample `GetDC`/`ReleaseDC`
+/// was pure churn at 20 Hz.
+struct ScreenDc(HDC);
+
+impl ScreenDc {
+    fn acquire() -> Option<Self> {
+        // SAFETY: screen DC for the whole desktop; released in `Drop`.
+        let hdc = unsafe { GetDC(None) };
+        (!hdc.is_invalid()).then_some(Self(hdc))
+    }
+
+    fn get(&self) -> HDC {
+        self.0
+    }
+}
+
+impl Drop for ScreenDc {
+    fn drop(&mut self) {
+        // SAFETY: balancing the `GetDC` in [`ScreenDc::acquire`].
+        unsafe {
+            let _ = ReleaseDC(None, self.0);
+        }
+    }
+}
+
 /// `SemaphoreReader` over the screen DC. Read failures degrade to
 /// [`Rgb::BLACK`] (idle) with rate-limited warnings.
 pub struct PixelReader {
@@ -37,13 +67,24 @@ pub struct PixelReader {
     strobe: (i32, i32),
     cached: Option<GameWindowInfo>,
     refreshed_at: Option<Instant>,
+    last_find_attempt: Option<Instant>,
+    screen_dc: Option<ScreenDc>,
     last_warn: Option<&'static str>,
 }
 
 impl PixelReader {
     /// Builds a reader for the given pixel points (client-relative px).
     pub fn new(game: GameWindow, cmd: (i32, i32), strobe: (i32, i32)) -> Self {
-        Self { game, cmd, strobe, cached: None, refreshed_at: None, last_warn: None }
+        Self {
+            game,
+            cmd,
+            strobe,
+            cached: None,
+            refreshed_at: None,
+            last_find_attempt: None,
+            screen_dc: None,
+            last_warn: None,
+        }
     }
 
     /// Samples any configured point. Returns exact RGB; `#000000` on failure.
@@ -56,19 +97,19 @@ impl PixelReader {
             self.warn_limited("ClientToScreen failed (window gone?); pixel read as idle");
             return Rgb::BLACK;
         };
-        // SAFETY: screen DC for the whole desktop; released below.
-        let hdc = unsafe { GetDC(None) };
-        if hdc.is_invalid() {
+        if self.screen_dc.is_none() {
+            self.screen_dc = ScreenDc::acquire();
+        }
+        let Some(dc) = self.screen_dc.as_ref() else {
             self.warn_limited("GetDC(screen) failed; pixel read as idle");
             return Rgb::BLACK;
-        }
-        // SAFETY: hdc from GetDC above; coordinates from ClientToScreen.
-        let colorref = unsafe { GetPixel(hdc, sx, sy) };
-        // SAFETY: balancing the GetDC call above.
-        unsafe {
-            let _ = ReleaseDC(None, hdc);
-        }
+        };
+        // SAFETY: dc is a live screen DC; coordinates from ClientToScreen.
+        let colorref = unsafe { GetPixel(dc.get(), sx, sy) };
         if colorref.0 == u32::MAX {
+            // Force a fresh DC next poll: a reset display chain can invalidate
+            // the cached one.
+            self.screen_dc = None;
             self.warn_limited("GetPixel failed (point outside the screen?); pixel read as idle");
             return Rgb::BLACK;
         }
@@ -84,6 +125,14 @@ impl PixelReader {
         if fresh {
             return self.cached.clone();
         }
+        // The game being closed is the common missing-window case; throttle
+        // the expensive re-scan instead of paying it at the poll rate.
+        if self.cached.is_none()
+            && self.last_find_attempt.is_some_and(|at| at.elapsed() < RETRY_FIND_AFTER)
+        {
+            return None;
+        }
+        self.last_find_attempt = Some(Instant::now());
         if let Some(info) = self.game.find() {
             self.refreshed_at = Some(Instant::now());
             self.cached = Some(info.clone());

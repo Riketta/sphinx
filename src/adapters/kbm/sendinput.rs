@@ -3,10 +3,16 @@
 //! [`ActuationGuard`]: with `require_foreground`, actuation is refused
 //! unless the game window is foreground - sphinx must never click into
 //! another window.
+//!
+//! Coordinate note: the pointer is moved with `SetCursorPos`, which takes
+//! physical virtual-screen coordinates - exactly what the per-monitor-aware
+//! guard produces. enigo's own `move_mouse(Abs)` is deliberately not used:
+//! it normalizes against the *primary* monitor's metrics only (no
+//! `MOUSEEVENTF_VIRTUALDESK`), so on a multi-monitor desktop it would land
+//! clicks somewhere else.
 
 use enigo::{
     Button,
-    Coordinate,
     Direction,
     Enigo,
     Keyboard,
@@ -17,6 +23,7 @@ use tracing::{
     info,
     warn,
 };
+use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
 
 use crate::{
     adapters::{
@@ -33,6 +40,13 @@ use crate::{
 pub struct SendInputKbm {
     guard: ActuationGuard,
     enigo: Enigo,
+}
+
+/// Moves the cursor to physical virtual-screen coordinates.
+fn move_cursor(sx: i32, sy: i32) -> bool {
+    // SAFETY: plain cursor move; coordinates come from the guard's
+    // ClientToScreen translation.
+    unsafe { SetCursorPos(sx, sy) }.is_ok()
 }
 
 impl SendInputKbm {
@@ -55,10 +69,10 @@ impl SendInputKbm {
     /// back. Diagnostics only; no foreground policy involved.
     pub fn smoke_move(&mut self) -> Result<(), enigo::InputError> {
         let (x, y) = self.enigo.location()?;
-        self.enigo.move_mouse(x + 1, y + 1, Coordinate::Abs)?;
-        info!(from_x = x, from_y = y, "smoke: moved pointer by (+1, +1)");
-        self.enigo.move_mouse(x, y, Coordinate::Abs)?;
-        info!(to_x = x, to_y = y, "smoke: moved pointer back");
+        if !move_cursor(x + 1, y + 1) || !move_cursor(x, y) {
+            return Err(enigo::InputError::Simulate("SetCursorPos failed"));
+        }
+        info!(from_x = x, from_y = y, "smoke: moved pointer by (+1, +1) and back");
         Ok(())
     }
 }
@@ -68,8 +82,14 @@ impl Kbm for SendInputKbm {
         let Some((sx, sy)) = self.guard.prepared_point("press", x, y) else {
             return;
         };
-        if let Err(e) = self.enigo.move_mouse(sx, sy, Coordinate::Abs) {
-            warn!(error = %e, "absolute mouse move failed");
+        if !move_cursor(sx, sy) {
+            warn!("absolute mouse move failed");
+            return;
+        }
+        // Re-check the policy with the cursor already in place: a fast
+        // alt-tab between discovery and the click must not click another
+        // window.
+        if !self.guard.still_prepared("press") {
             return;
         }
         if let Err(e) = self.enigo.button(Button::Left, Direction::Click) {

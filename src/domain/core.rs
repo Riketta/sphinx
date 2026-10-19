@@ -218,7 +218,10 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
             warn!(expected = %sample, read = %verified, "CMD changed before actuation -> ignored");
             return;
         }
-        if !self.guard_allows(now) {
+        // ABORT is the escape hatch and must never be throttled: a skipped
+        // abort leaves the buy dialog stuck until the addon's own stage
+        // timeout. Only purchases carry the burst guard.
+        if !matches!(command, Command::Abort) && !self.guard_allows(now) {
             return;
         }
         self.stats.actuations += 1;
@@ -241,12 +244,13 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
         }
     }
 
-    /// Burst guard (M4): refuses an actuation landing too soon after the
+    /// Burst guard (M4): refuses a purchase landing too soon after the
     /// previous one, or past the rolling per-minute ceiling. The strobe edge
     /// is still consumed (the caller already entered `WaitClear`) - the
     /// addon's own stage timeouts surface the skipped command. Sphinx must
     /// never answer a runaway signal rate with a runaway click rate; warnings
-    /// are throttled so a signal storm logs, not floods.
+    /// are throttled so a signal storm logs, not floods. ABORT is exempt (it
+    /// is the escape hatch, never a purchase).
     fn guard_allows(&mut self, now: u64) -> bool {
         if let Some(last) = self.last_actuation_ms {
             if now.saturating_sub(last) < self.timing.min_actuation_interval_ms {
@@ -467,26 +471,6 @@ mod tests {
     }
 
     #[test]
-    fn unstable_cmd_never_actuates() {
-        let reader = FakeReader::new(Rgb::BLACK, vec![Rgb::RED, Rgb::GREEN]);
-        reader.fallback.set(Rgb::GREEN);
-        let kbm = Rc::new(FakeKbm::default());
-        let kill = Rc::new(FakeKill::default());
-        let clock = clock();
-        let mut core = make_core(&reader, &kbm, &kill, &clock);
-
-        reader.strobe.set(Rgb::WHITE);
-        clock.t.set(50);
-        assert_eq!(core.step(), StepOutcome::Continue);
-        for t in [100, 150, 200, 250, 300, 350, 400] {
-            clock.t.set(t);
-            assert_eq!(core.step(), StepOutcome::Continue);
-        }
-        assert_eq!(pressed(&kbm), [] as [(i32, i32); 0]);
-        assert_eq!(*kbm.keys.borrow(), [] as [Key; 0]);
-    }
-
-    #[test]
     fn falling_strobe_during_debounce_cancels() {
         let reader = FakeReader::new(Rgb::BLACK, vec![Rgb::RED]);
         let kbm = Rc::new(FakeKbm::default());
@@ -494,6 +478,8 @@ mod tests {
         let clock = clock();
         let mut core = make_core(&reader, &kbm, &kill, &clock);
 
+        // Seed a black observation so the first white is a real edge.
+        assert_eq!(core.step(), StepOutcome::Continue);
         reader.strobe.set(Rgb::WHITE);
         clock.t.set(50);
         assert_eq!(core.step(), StepOutcome::Continue);
@@ -501,6 +487,7 @@ mod tests {
         clock.t.set(100);
         assert_eq!(core.step(), StepOutcome::Continue);
         assert_eq!(pressed(&kbm), [] as [(i32, i32); 0]);
+        assert_eq!(core.stats().actuations, 0, "the edge must have entered debounce");
     }
 
     #[test]
@@ -513,12 +500,80 @@ mod tests {
         let clock = clock();
         let mut core = make_core(&reader, &kbm, &kill, &clock);
 
+        // Seed a black observation so the first white is a real edge.
+        assert_eq!(core.step(), StepOutcome::Continue);
         reader.strobe.set(Rgb::WHITE);
         clock.t.set(50);
         assert_eq!(core.step(), StepOutcome::Continue);
         clock.t.set(100);
         assert_eq!(core.step(), StepOutcome::Continue);
         assert_eq!(pressed(&kbm), [] as [(i32, i32); 0]);
+        assert_eq!(core.stats().actuations, 0, "the edge must have reached re-verify");
+    }
+
+    #[test]
+    fn cmd_flapping_until_watchdog_never_actuates() {
+        // CMD alternates every poll: the debounce can never close, so the
+        // Debounce-state watchdog must reclaim the edge with no actuation.
+        let script: Vec<Rgb> =
+            (0..64).map(|i| if i % 2 == 0 { Rgb::RED } else { Rgb::GREEN }).collect();
+        let reader = FakeReader::new(Rgb::BLACK, script);
+        let kbm = Rc::new(FakeKbm::default());
+        let kill = Rc::new(FakeKill::default());
+        let clock = clock();
+        let mut core = Core::new(
+            reader.clone(),
+            kbm.clone(),
+            kill.clone(),
+            clock.clone(),
+            CoreTargets { buyout: BUYOUT, confirm: CONFIRM },
+            Key::Escape,
+            CoreTiming {
+                debounce_ms: 25,
+                watchdog_ms: 200,
+                min_actuation_interval_ms: 0,
+                max_actuations_per_min: u32::MAX,
+            },
+        );
+
+        // Seed a black observation so the first white is a real edge.
+        assert_eq!(core.step(), StepOutcome::Continue);
+        reader.strobe.set(Rgb::WHITE);
+        clock.t.set(50);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        for t in [100, 150, 200, 250, 300] {
+            clock.t.set(t);
+            assert_eq!(core.step(), StepOutcome::Continue);
+        }
+        // 300 - 50 = 250 > 200: the watchdog reclaimed the flapping edge.
+        assert_eq!(core.stats().watchdogs, 1);
+        assert_eq!(pressed(&kbm), [] as [(i32, i32); 0]);
+        assert_eq!(*kbm.keys.borrow(), [] as [Key; 0]);
+        assert_eq!(core.stats().actuations, 0);
+    }
+
+    #[test]
+    fn cmd_change_then_stabilize_actuates_after_restart() {
+        // The debounce restarts when the CMD changes, then the stable color
+        // fires once its own debounce window closes.
+        let reader = FakeReader::new(Rgb::BLACK, vec![Rgb::RED, Rgb::GREEN]);
+        reader.fallback.set(Rgb::GREEN);
+        let kbm = Rc::new(FakeKbm::default());
+        let kill = Rc::new(FakeKill::default());
+        let clock = clock();
+        let mut core = make_core(&reader, &kbm, &kill, &clock);
+
+        // Seed a black observation so the first white is a real edge.
+        assert_eq!(core.step(), StepOutcome::Continue);
+        reader.strobe.set(Rgb::WHITE);
+        clock.t.set(50);
+        assert_eq!(core.step(), StepOutcome::Continue, "edge reads RED");
+        clock.t.set(100);
+        assert_eq!(core.step(), StepOutcome::Continue, "sample GREEN != RED -> restart");
+        clock.t.set(150);
+        assert_eq!(core.step(), StepOutcome::Continue, "stable GREEN debounce -> fire");
+        assert_eq!(pressed(&kbm), vec![CONFIRM]);
+        assert_eq!(core.stats().actuations, 1);
     }
 
     #[test]
@@ -635,6 +690,8 @@ mod tests {
         let clock = clock();
         let mut core = make_core(&reader, &kbm, &kill, &clock);
 
+        // Seed a black observation so the first white is a real edge.
+        assert_eq!(core.step(), StepOutcome::Continue);
         reader.strobe.set(Rgb::WHITE);
         clock.t.set(50);
         assert_eq!(core.step(), StepOutcome::Continue);
@@ -642,6 +699,7 @@ mod tests {
         assert_eq!(core.step(), StepOutcome::Continue);
         assert_eq!(pressed(&kbm), [] as [(i32, i32); 0]);
         assert_eq!(*kbm.keys.borrow(), [] as [Key; 0]);
+        assert_eq!(core.stats().actuations, 0, "the edge must have reached decode");
     }
 
     #[test]
@@ -742,6 +800,47 @@ mod tests {
         // An hour later the window has drained: actuation works again.
         run_cycle(&reader, &kbm, &kill, &clock, &mut core, 61_300);
         assert_eq!(pressed(&kbm), vec![BUYOUT, BUYOUT, BUYOUT]);
+    }
+
+    #[test]
+    fn abort_is_not_throttled_by_the_burst_guard() {
+        let reader = FakeReader::new(Rgb::BLACK, vec![Rgb::RED, Rgb::RED, Rgb::RED]);
+        reader.fallback.set(Rgb::YELLOW);
+        let kbm = Rc::new(FakeKbm::default());
+        let kill = Rc::new(FakeKill::default());
+        let clock = clock();
+        let mut core = Core::new(
+            reader.clone(),
+            kbm.clone(),
+            kill.clone(),
+            clock.clone(),
+            CoreTargets { buyout: BUYOUT, confirm: CONFIRM },
+            Key::Escape,
+            CoreTiming {
+                debounce_ms: 25,
+                watchdog_ms: 10_000,
+                min_actuation_interval_ms: 250,
+                max_actuations_per_min: u32::MAX,
+            },
+        );
+
+        // Purchase at t=100...
+        run_cycle(&reader, &kbm, &kill, &clock, &mut core, 0);
+        assert_eq!(pressed(&kbm), vec![BUYOUT]);
+
+        // ...ABORT lands 50ms after the purchase: inside the burst interval,
+        // but the escape hatch must still fire.
+        reader.strobe.set(Rgb::BLACK);
+        clock.t.set(150);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        reader.strobe.set(Rgb::WHITE);
+        clock.t.set(200);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        clock.t.set(250);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        assert_eq!(*kbm.keys.borrow(), vec![Key::Escape]);
+        assert_eq!(pressed(&kbm), vec![BUYOUT], "abort must not press the mouse");
+        assert_eq!(core.stats().aborts, 1);
     }
 
     #[test]

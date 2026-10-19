@@ -10,10 +10,15 @@ use crate::ports::ControlInput;
 /// The ESC virtual-key code, shared by `[abort_key]` validation.
 pub const VK_ESCAPE: u8 = 0x1B;
 
-/// A parsed hotkey: modifier + main key codes checked on every poll.
+/// The right Windows key; `win` in a hotkey matches either Windows key.
+const VK_RWIN: u8 = 0x5C;
+
+/// A parsed hotkey: modifier + main key codes checked on every poll. Each
+/// entry is `(primary, alt)` — `alt` is checked as an acceptable substitute
+/// (`win` matches either Windows key).
 pub struct Hotkey {
     spec: String,
-    codes: Vec<u8>,
+    codes: Vec<(u8, Option<u8>)>,
 }
 
 impl Hotkey {
@@ -35,12 +40,13 @@ impl Hotkey {
                 return Err(format!(
                     "unknown key {name:?} in hotkey {spec:?} (supported: ctrl, alt, shift, \
                      win, f1-f24, a-z, 0-9, escape, tab, space, enter, backspace, insert, \
-                     delete, home, end, pageup, pagedown)"
+                     delete, home, end, pageup, pagedown, capslock, numlock, scrolllock, menu)"
                 ));
             };
             all_modifiers &=
                 matches!(name.as_str(), "ctrl" | "control" | "alt" | "shift" | "win" | "super");
-            codes.push(code);
+            let alt = if name == "win" || name == "super" { Some(VK_RWIN) } else { None };
+            codes.push((code, alt));
         }
         if codes.is_empty() || all_modifiers {
             return Err(format!("hotkey {spec:?} needs a non-modifier main key"));
@@ -55,13 +61,15 @@ impl Hotkey {
 
     /// True while every key of the combination is held down.
     pub fn is_down(&self) -> bool {
-        self.codes.iter().all(|&vk| {
-            // SAFETY: polled async key state; the documented non-hook way
-            // to implement the kill switch. The high bit of the i16 result
-            // means "currently down".
-            unsafe { GetAsyncKeyState(i32::from(vk)) }.is_negative()
-        })
+        self.codes.iter().all(|&(vk, alt)| key_down(vk) || alt.is_some_and(key_down))
     }
+}
+
+/// Polled async key state; the documented non-hook way to read a key.
+fn key_down(vk: u8) -> bool {
+    // SAFETY: polled async key state; the high bit of the i16 result means
+    // "currently down".
+    unsafe { GetAsyncKeyState(i32::from(vk)) }.is_negative()
 }
 
 impl ControlInput for Hotkey {
@@ -151,6 +159,17 @@ mod tests {
         assert_eq!(key_code("f1"), Some(0x70));
         assert_eq!(key_code("f12"), Some(0x7B));
         assert_eq!(key_code("f24"), Some(0x87));
+        assert_eq!(key_code("capslock"), Some(0x14));
+        assert_eq!(key_code("numlock"), Some(0x90));
+        assert_eq!(key_code("scrolllock"), Some(0x91));
+        assert_eq!(key_code("menu"), Some(0x12));
         assert_eq!(key_code("nope"), None);
+    }
+
+    #[test]
+    fn win_hotkey_parses() -> Result<(), String> {
+        let hk = Hotkey::parse("win+q")?;
+        assert_eq!(hk.spec(), "win+q");
+        Ok(())
     }
 }

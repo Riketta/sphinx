@@ -35,14 +35,20 @@ use crate::{
         game_window::{
             ensure_dpi_awareness,
             foreground_hwnd,
+            process_elevated,
             same_window,
             screen_size,
+            self_elevated,
             system_dpi,
             window_process_image,
             window_title,
             GameWindow,
         },
-        hotkey::Hotkey,
+        hotkey::{
+            key_code,
+            Hotkey,
+            VK_ESCAPE,
+        },
         kbm::SendInputKbm,
         pixel_reader::PixelReader,
     },
@@ -65,14 +71,19 @@ use crate::{
     },
 };
 
-/// Wall clock for the poll loop.
-struct SystemClock;
+/// Exit code when the kill switch fires - distinct from a clean stop so a
+/// supervisor can tell the two apart.
+const EXIT_KILLED: i32 = 130;
 
-impl Clock for SystemClock {
+/// Monotonic clock for the poll loop: NTP steps or manual clock changes must
+/// never stretch or shrink the debounce, watchdog and burst-guard windows.
+struct MonotonicClock {
+    start: Instant,
+}
+
+impl Clock for MonotonicClock {
     fn now_ms(&self) -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 }
 
@@ -185,7 +196,7 @@ fn init_tracing() {
 
 fn build_reader(cfg: &Config) -> PixelReader {
     PixelReader::new(
-        GameWindow::new(&cfg.process_names()),
+        GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref()),
         (cfg.pixels.cmd.x, cfg.pixels.cmd.y),
         (cfg.pixels.strobe.x, cfg.pixels.strobe.y),
     )
@@ -193,7 +204,7 @@ fn build_reader(cfg: &Config) -> PixelReader {
 
 fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
     cfg.validate()?;
-    let game = GameWindow::new(&cfg.process_names());
+    let game = GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref());
     let reader = build_reader(cfg);
     let kill = Hotkey::parse(&cfg.kill_hotkey)
         .map_err(anyhow::Error::msg)
@@ -217,7 +228,8 @@ fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
         }
         #[cfg(not(feature = "serial"))]
         bail!(
-            "backend.kind = \"serial\" needs a build with --features serial (validate should have caught this)"
+            "backend.kind = \"serial\" needs a build with --features serial (validate should have \
+             caught this)"
         );
     } else {
         AnyKbm::Live(
@@ -225,8 +237,27 @@ fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
                 .context("enigo init failed")?,
         )
     };
+    // validate() pinned [abort_key] to "escape"; mapping the config value
+    // here keeps the config the single source of truth for what the core
+    // sends.
+    let abort_name = cfg.abort_key.key.to_lowercase();
+    let abort_key = match key_code(&abort_name) {
+        Some(vk) if vk == VK_ESCAPE => Key::Escape,
+        _ => bail!("abort_key {:?} is not supported (v1: \"escape\")", cfg.abort_key.key),
+    };
     let kill_spec = kill.spec().to_string();
-    let clock = SystemClock;
+    // Derive the label before `kbm` moves into the core.
+    let backend_kind = if dry_run {
+        "dry-run"
+    } else {
+        match &kbm {
+            AnyKbm::Live(_) => "sendinput",
+            #[cfg(feature = "serial")]
+            AnyKbm::Serial(_) => "serial",
+            AnyKbm::Dry { .. } => "dry-run",
+        }
+    };
+    let clock = MonotonicClock { start: Instant::now() };
     let mut core = Core::new(
         reader,
         kbm,
@@ -236,7 +267,7 @@ fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
             buyout: (cfg.targets.buyout.x, cfg.targets.buyout.y),
             confirm: (cfg.targets.confirm.x, cfg.targets.confirm.y),
         },
-        Key::Escape,
+        abort_key,
         CoreTiming {
             debounce_ms: cfg.debounce_ms,
             watchdog_ms: cfg.watchdog_ms,
@@ -249,7 +280,7 @@ fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
         kill = %kill_spec,
         debounce_ms = cfg.debounce_ms,
         watchdog_ms = cfg.watchdog_ms,
-        backend = if dry_run { "dry-run" } else { "sendinput" },
+        backend = backend_kind,
         "sphinx running (Ctrl+C also exits)"
     );
     let start = Instant::now();
@@ -257,8 +288,9 @@ fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
     loop {
         if core.step() == StepOutcome::Exit {
             // Immediate exit on the kill switch (§3.6): the addon's stage
-            // timeouts clean up the game state.
-            std::process::exit(0);
+            // timeouts clean up the game state. Distinct exit code so a
+            // supervisor sees the emergency stop.
+            std::process::exit(EXIT_KILLED);
         }
         // Soak-test heartbeat (M4): one visibility line per 5 minutes, so a
         // quiet healthy session is distinguishable from a dead terminal.
@@ -304,10 +336,10 @@ fn doctor(cfg: &Config, smoke: bool) -> anyhow::Result<()> {
     let mut failures: usize = 0;
 
     info!(dpi = system_dpi(), "dpi: process is per-monitor aware (96 = 100%)");
-    doctor_screen(cfg);
+    failures += doctor_screen(cfg);
     failures += doctor_window(cfg);
     doctor_ui_scale(cfg);
-    doctor_pixels(cfg);
+    failures += doctor_pixels(cfg);
     doctor_kill(cfg);
     failures += doctor_smoke(cfg, smoke)?;
 
@@ -318,11 +350,14 @@ fn doctor(cfg: &Config, smoke: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn doctor_screen(cfg: &Config) {
+/// Returns 1 on a configured-vs-live screen mismatch: points calibrated for
+/// another resolution sample garbage, so this is a failure, not a warning.
+fn doctor_screen(cfg: &Config) -> usize {
     let (w, h) = screen_size();
     match &cfg.screen {
         Some(s) if s.width == w && s.height == h => {
             info!(width = w, height = h, "screen: matches config");
+            0
         }
         Some(s) => {
             warn!(
@@ -332,15 +367,19 @@ fn doctor_screen(cfg: &Config) {
                 config_height = s.height,
                 "screen: mismatch - re-run `/am semaphore coords` and update sphinx.toml"
             );
+            1
         }
-        None => info!(width = w, height = h, "screen: no reference in config"),
+        None => {
+            info!(width = w, height = h, "screen: no reference in config");
+            0
+        }
     }
 }
 
 /// Returns 1 when the game window cannot be found (everything downstream
 /// depends on it), 0 otherwise.
 fn doctor_window(cfg: &Config) -> usize {
-    let game = GameWindow::new(&cfg.process_names());
+    let game = GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref());
     let Some(info) = game.find() else {
         warn!(
             searched = ?cfg.process_names(),
@@ -357,6 +396,17 @@ fn doctor_window(cfg: &Config) -> usize {
         client_height = info.client.1,
         "window: game found"
     );
+
+    // UIPI: an elevated game silently drops SendInput from a non-elevated
+    // sphinx while every foreground check still passes - the worst kind of
+    // failure, so doctor treats it as fatal.
+    if process_elevated(info.pid).zip(self_elevated()) == Some((true, false)) {
+        warn!(
+            "window: the game runs elevated but sphinx does not - actuation will be silently \
+             dropped by UIPI; run sphinx elevated"
+        );
+        return 1;
+    }
 
     match foreground_hwnd() {
         Some(fg) if same_window(fg, info.hwnd) => info!("foreground: the game window"),
@@ -376,7 +426,34 @@ fn doctor_ui_scale(cfg: &Config) {
     }
 }
 
-fn doctor_pixels(cfg: &Config) {
+/// Returns 1 when a configured point falls outside the client rect (guaranteed
+/// garbage sampling) or the strobe reads WHITE at rest (committed command or
+/// misaligned points).
+fn doctor_pixels(cfg: &Config) -> usize {
+    let mut failures = 0;
+    if let Some(info) =
+        GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref()).find()
+    {
+        let points = [
+            ("cmd", cfg.pixels.cmd.x, cfg.pixels.cmd.y),
+            ("strobe", cfg.pixels.strobe.x, cfg.pixels.strobe.y),
+            ("buyout", cfg.targets.buyout.x, cfg.targets.buyout.y),
+            ("confirm", cfg.targets.confirm.x, cfg.targets.confirm.y),
+        ];
+        for (name, x, y) in points {
+            if x < 0 || y < 0 || x >= info.client.0 || y >= info.client.1 {
+                warn!(
+                    point = name,
+                    x,
+                    y,
+                    client_width = info.client.0,
+                    client_height = info.client.1,
+                    "pixels: point outside the client rect - fix it in sphinx.toml"
+                );
+                failures += 1;
+            }
+        }
+    }
     let mut reader = build_reader(cfg);
     let cmd = reader.read_point((cfg.pixels.cmd.x, cfg.pixels.cmd.y));
     let strobe = reader.read_point((cfg.pixels.strobe.x, cfg.pixels.strobe.y));
@@ -390,6 +467,7 @@ fn doctor_pixels(cfg: &Config) {
             "pixels: strobe is WHITE at rest - a command is committed, or the \
              points are misaligned; re-check with `/am semaphore coords`"
         );
+        failures += 1;
     } else if cmd == Rgb::BLACK {
         info!("pixels: idle exact black - semaphore visible and idle, clean sampling");
     } else if Command::from_rgb(cmd).is_some() {
@@ -413,9 +491,12 @@ fn doctor_pixels(cfg: &Config) {
         confirm = %confirm,
         "targets: samples (meaningful with the AH buy screen open; use `calibrate` to align)"
     );
+    failures
 }
 
 fn doctor_kill(cfg: &Config) {
+    // validate() has already refused an unparsable hotkey, so the Err arm is
+    // a belt-and-suspenders guard, not a reachable path.
     match Hotkey::parse(&cfg.kill_hotkey) {
         Ok(kill) => info!(
             kill = kill.spec(),
@@ -441,7 +522,7 @@ fn doctor_smoke(cfg: &Config, smoke: bool) -> anyhow::Result<usize> {
                 serial.baud,
                 cfg.require_foreground,
                 cfg.focus_if_needed,
-                GameWindow::new(&cfg.process_names()),
+                GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref()),
             )
             .context("smoke: serial link ping failed")?;
             info!("smoke: serial link ping acked");
@@ -450,8 +531,12 @@ fn doctor_smoke(cfg: &Config, smoke: bool) -> anyhow::Result<usize> {
         #[cfg(not(feature = "serial"))]
         return Ok(0); // validate() already refused this combination
     }
-    let mut kbm = SendInputKbm::new(false, false, GameWindow::new(&cfg.process_names()))
-        .context("enigo init failed")?;
+    let mut kbm = SendInputKbm::new(
+        false,
+        false,
+        GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref()),
+    )
+    .context("enigo init failed")?;
     let before = kbm.cursor();
     match kbm.smoke_move() {
         Ok(()) => info!(
