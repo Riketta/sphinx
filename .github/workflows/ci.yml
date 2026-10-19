@@ -39,16 +39,16 @@ jobs:
         run: cargo +nightly fmt --all --check
 
       - name: "Clippy (pedantic + denied unwrap/expect/panic/indexing/slicing)"
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: "Clippy (serial feature: v2 hardware backend)"
-        run: cargo clippy --all-targets --features serial -- -D warnings
+        run: cargo clippy --all-targets --features serial --locked -- -D warnings
 
       - name: Tests (core state machine with fake ports)
-        run: cargo test
+        run: cargo test --locked
 
       - name: Tests (serial protocol ack/retry)
-        run: cargo test --features serial
+        run: cargo test --features serial --locked
 
       - name: Build
-        run: cargo build
+        run: cargo build --locked

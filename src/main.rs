@@ -22,6 +22,20 @@ use tracing::{
     info,
     warn,
 };
+use windows::{
+    core::{
+        w,
+        PCWSTR,
+    },
+    Win32::{
+        Foundation::{
+            GetLastError,
+            ERROR_ALREADY_EXISTS,
+            HANDLE,
+        },
+        System::Threading::CreateMutexW,
+    },
+};
 
 mod adapters;
 mod config;
@@ -75,6 +89,10 @@ use crate::{
 /// supervisor can tell the two apart.
 const EXIT_KILLED: i32 = 130;
 
+/// Name of the `run`-mode single-instance mutex: two live sphinxes would
+/// both actuate on the same semaphore edge.
+const INSTANCE_MUTEX_NAME: PCWSTR = w!("sphinx-run-single-instance");
+
 /// Monotonic clock for the poll loop: NTP steps or manual clock changes must
 /// never stretch or shrink the debounce, watchdog and burst-guard windows.
 struct MonotonicClock {
@@ -103,8 +121,9 @@ impl Kbm for AnyKbm {
         match self {
             Self::Live(kbm) => kbm.press(x, y),
             Self::Dry { require_foreground, game } => {
-                dry_note(*require_foreground, game, "press");
-                info!("[dry-run] would press ({x}, {y})");
+                if dry_note(*require_foreground, game, "press") {
+                    info!("[dry-run] would press ({x}, {y})");
+                }
             }
             #[cfg(feature = "serial")]
             Self::Serial(kbm) => kbm.press(x, y),
@@ -115,8 +134,9 @@ impl Kbm for AnyKbm {
         match self {
             Self::Live(kbm) => kbm.key(key),
             Self::Dry { require_foreground, game } => {
-                dry_note(*require_foreground, game, "key");
-                info!("[dry-run] would send {key:?}");
+                if dry_note(*require_foreground, game, "key") {
+                    info!("[dry-run] would send {key:?}");
+                }
             }
             #[cfg(feature = "serial")]
             Self::Serial(kbm) => kbm.key(key),
@@ -134,14 +154,18 @@ impl Kbm for AnyKbm {
 }
 
 /// Rehearsal-only note mirroring the live foreground guard's findings.
-fn dry_note(require_foreground: bool, game: &mut GameWindow, action: &str) {
+/// Returns whether the live backend would actuate, so the caller logs
+/// exactly one outcome per event (skip *or* actuation, never both).
+fn dry_note(require_foreground: bool, game: &mut GameWindow, action: &str) -> bool {
     let Some(info) = game.find() else {
         info!("[dry-run] WoW window not found (would skip {action})");
-        return;
+        return false;
     };
     if require_foreground && !foreground_hwnd().is_some_and(|fg| same_window(fg, info.hwnd)) {
         info!("[dry-run] WoW not foreground (would skip {action})");
+        return false;
     }
+    true
 }
 
 #[derive(Parser)]
@@ -202,9 +226,49 @@ fn build_reader(cfg: &Config) -> PixelReader {
     )
 }
 
+/// Creates the named single-instance mutex for a live `run` session. The
+/// caller keeps the handle alive for the run duration; the OS reclaims it
+/// at exit.
+///
+/// # Errors
+/// Another sphinx instance is already running, or `CreateMutexW` failed.
+fn acquire_instance_mutex() -> anyhow::Result<HANDLE> {
+    // SAFETY: the name is a NUL-terminated wide literal; the returned
+    // handle stays owned by the caller for the run duration.
+    let handle = unsafe { CreateMutexW(None, false, INSTANCE_MUTEX_NAME) }
+        .context("creating the single-instance mutex failed")?;
+    // SAFETY: immediate last-error read after the CreateMutexW call - a
+    // pre-existing mutex still returns a valid handle and reports this way.
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        bail!("another sphinx instance is already running");
+    }
+    Ok(handle)
+}
+
+/// One-shot UIPI check for `run`: an elevated game silently drops input
+/// from a non-elevated sphinx while every foreground check still passes.
+/// Best effort - a failed token query (or a missing game window) just
+/// skips the warning; `doctor` checks elevation strictly.
+fn warn_once_if_elevation_mismatch(game: &GameWindow) {
+    let Some(info) = game.find() else {
+        return;
+    };
+    if process_elevated(info.pid).zip(self_elevated()) == Some((true, false)) {
+        warn!(
+            "the game runs elevated but sphinx does not - actuation will be silently dropped \
+             by UIPI; run sphinx elevated"
+        );
+    }
+}
+
 fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
     cfg.validate()?;
+    // Single-instance guard: two live processes would both actuate on the
+    // same semaphore edge. The dry-run backend never sends input, so two
+    // rehearsals may run side by side. The handle must outlive the loop.
+    let _instance_mutex = if dry_run { None } else { Some(acquire_instance_mutex()?) };
     let game = GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref());
+    warn_once_if_elevation_mismatch(&game);
     let reader = build_reader(cfg);
     let kill = Hotkey::parse(&cfg.kill_hotkey)
         .map_err(anyhow::Error::msg)
@@ -399,13 +463,24 @@ fn doctor_window(cfg: &Config) -> usize {
 
     // UIPI: an elevated game silently drops SendInput from a non-elevated
     // sphinx while every foreground check still passes - the worst kind of
-    // failure, so doctor treats it as fatal.
-    if process_elevated(info.pid).zip(self_elevated()) == Some((true, false)) {
-        warn!(
-            "window: the game runs elevated but sphinx does not - actuation will be silently \
-             dropped by UIPI; run sphinx elevated"
-        );
-        return 1;
+    // failure, so doctor treats it as fatal. An unanswerable token query
+    // fails closed: refusing to assume safe beats a silent dropper.
+    match (process_elevated(info.pid), self_elevated()) {
+        (Some(true), Some(false)) => {
+            warn!(
+                "window: the game runs elevated but sphinx does not - actuation will be silently \
+                 dropped by UIPI; run sphinx elevated"
+            );
+            return 1;
+        }
+        (None, _) | (_, None) => {
+            warn!(
+                "window: could not determine elevation tokens - refusing to assume safe; run \
+                 sphinx and the game at the same privilege level"
+            );
+            return 1;
+        }
+        _ => {}
     }
 
     match foreground_hwnd() {

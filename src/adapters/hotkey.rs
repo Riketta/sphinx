@@ -19,6 +19,9 @@ const VK_RWIN: u8 = 0x5C;
 pub struct Hotkey {
     spec: String,
     codes: Vec<(u8, Option<u8>)>,
+    /// Whether any part of the combination is a modifier. A modifier-less
+    /// kill hotkey would exit sphinx on every tap of the main key.
+    has_modifier: bool,
 }
 
 impl Hotkey {
@@ -31,6 +34,7 @@ impl Hotkey {
     pub fn parse(spec: &str) -> Result<Self, String> {
         let mut codes = Vec::new();
         let mut all_modifiers = true;
+        let mut has_modifier = false;
         for part in spec.split('+') {
             let name = part.trim().to_lowercase();
             if name.is_empty() {
@@ -43,20 +47,28 @@ impl Hotkey {
                      delete, home, end, pageup, pagedown, capslock, numlock, scrolllock, menu)"
                 ));
             };
-            all_modifiers &=
+            let is_modifier =
                 matches!(name.as_str(), "ctrl" | "control" | "alt" | "shift" | "win" | "super");
+            all_modifiers &= is_modifier;
+            has_modifier |= is_modifier;
             let alt = if name == "win" || name == "super" { Some(VK_RWIN) } else { None };
             codes.push((code, alt));
         }
         if codes.is_empty() || all_modifiers {
             return Err(format!("hotkey {spec:?} needs a non-modifier main key"));
         }
-        Ok(Self { spec: spec.to_string(), codes })
+        Ok(Self { spec: spec.to_string(), codes, has_modifier })
     }
 
     /// The original config string (for `doctor` output).
     pub fn spec(&self) -> &str {
         &self.spec
+    }
+
+    /// Whether the combination includes at least one modifier key
+    /// (`ctrl`/`alt`/`shift`/`win`).
+    pub fn has_modifier(&self) -> bool {
+        self.has_modifier
     }
 
     /// True while every key of the combination is held down.

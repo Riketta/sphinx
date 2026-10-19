@@ -107,8 +107,10 @@ pub struct Core<R, K, C, T> {
     last_actuation_ms: Option<u64>,
     /// Burst guard: accepted actuation timestamps inside the last minute.
     recent_actuations: VecDeque<u64>,
-    /// Burst guard warn throttle: when the last skipped-actuation warn fired.
-    last_guard_warn_ms: u64,
+    /// Burst guard warn throttle: when the last skipped-actuation warn fired
+    /// (`None` = never, so the first skip warns immediately instead of
+    /// being swallowed by the 2 s window).
+    last_guard_warn_ms: Option<u64>,
     /// Lifetime counters (heartbeat).
     stats: CoreStats,
 }
@@ -137,7 +139,7 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
             last_strobe: None,
             last_actuation_ms: None,
             recent_actuations: VecDeque::new(),
-            last_guard_warn_ms: 0,
+            last_guard_warn_ms: None,
             stats: CoreStats::default(),
         }
     }
@@ -274,13 +276,14 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
     }
 
     fn guard_warn(&mut self, now: u64) {
-        if now.saturating_sub(self.last_guard_warn_ms) >= 2_000 {
-            self.last_guard_warn_ms = now;
-            warn!(
-                "actuation skipped by the burst guard (interval {}ms / ceiling {}/min)",
-                self.timing.min_actuation_interval_ms, self.timing.max_actuations_per_min
-            );
+        if self.last_guard_warn_ms.is_some_and(|last| now.saturating_sub(last) < 2_000) {
+            return;
         }
+        self.last_guard_warn_ms = Some(now);
+        warn!(
+            "actuation skipped by the burst guard (interval {}ms / ceiling {}/min)",
+            self.timing.min_actuation_interval_ms, self.timing.max_actuations_per_min
+        );
     }
 }
 
@@ -797,7 +800,8 @@ mod tests {
         run_cycle(&reader, &kbm, &kill, &clock, &mut core, 2_100);
         assert_eq!(pressed(&kbm), vec![BUYOUT, BUYOUT]);
 
-        // An hour later the window has drained: actuation works again.
+        // ~61 s later both earlier actuations have drained out of the 60 s
+        // rolling window: actuation works again.
         run_cycle(&reader, &kbm, &kill, &clock, &mut core, 61_300);
         assert_eq!(pressed(&kbm), vec![BUYOUT, BUYOUT, BUYOUT]);
     }

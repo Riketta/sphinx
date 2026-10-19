@@ -250,6 +250,37 @@ impl Config {
             .filter(|t| !t.trim().is_empty())
     }
 
+    /// Kill-hotkey hardening beyond [`Hotkey::parse`]: the emergency stop
+    /// must not be a trap. A modifier-less combination exits sphinx on every
+    /// tap of the main key; `escape` is the ABORT key sphinx itself sends,
+    /// so the kill switch would fire right as an abort lands.
+    ///
+    /// # Errors
+    /// Modifier-less hotkey, or any `escape` part in the combination.
+    fn validate_kill_hotkey(&self) -> anyhow::Result<()> {
+        let kill = Hotkey::parse(&self.kill_hotkey).map_err(|e| {
+            anyhow::anyhow!("kill_hotkey {e} (this is your emergency stop - fix it)")
+        })?;
+        if !kill.has_modifier() {
+            bail!(
+                "kill_hotkey {:?} has no modifier - it would exit sphinx on every tap of that \
+                 key; add ctrl/alt/shift/win",
+                self.kill_hotkey
+            );
+        }
+        if self
+            .kill_hotkey
+            .split('+')
+            .any(|part| key_code(&part.trim().to_lowercase()) == Some(VK_ESCAPE))
+        {
+            bail!(
+                "kill_hotkey {:?} must not use escape - it is the ABORT key; pick another key",
+                self.kill_hotkey
+            );
+        }
+        Ok(())
+    }
+
     /// Cross-field validation; also parses the kill hotkey and abort key so
     /// bad values fail at startup, never mid-session.
     ///
@@ -289,15 +320,20 @@ impl Config {
         if !(1..=600).contains(&self.max_actuations_per_min) {
             bail!("max_actuations_per_min {} outside 1..=600", self.max_actuations_per_min);
         }
-        Hotkey::parse(&self.kill_hotkey).map_err(|e| {
-            anyhow::anyhow!("kill_hotkey {e} (this is your emergency stop - fix it)")
-        })?;
+        self.validate_kill_hotkey()?;
         // Case-insensitive like the kill hotkey parser: `"Escape"` must not
         // fail where `"escape"` works.
         match key_code(&self.abort_key.key.to_lowercase()) {
             None => bail!("abort_key.key {:?} is not a known key name", self.abort_key.key),
             Some(vk) if vk == VK_ESCAPE => {}
             Some(_) => bail!("abort_key: v1 supports only \"escape\""),
+        }
+        // An empty list would silently disable window discovery forever.
+        if self.process_names().is_empty() {
+            bail!(
+                "[backend.window] process_names must not be empty - window discovery would \
+                   never find anything"
+            );
         }
         match self.backend.kind {
             BackendKind::Sendinput => {}
@@ -347,6 +383,7 @@ mod tests {
         BackendKind,
         Config,
         ScreenRef,
+        WindowBackend,
     };
 
     /// Full valid config used as the base for `validate` mutation tests.
@@ -451,6 +488,30 @@ mod tests {
         assert!(validated(|cfg| cfg.abort_key.key = "nope".to_string()).is_err());
         // ...and wrongly cased must still work.
         assert!(validated(|cfg| cfg.abort_key.key = "Escape".to_string()).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_modifierless_kill_hotkey() {
+        // A bare key would exit sphinx on every tap - the default stays valid.
+        assert!(validated(|cfg| cfg.kill_hotkey = "q".to_string()).is_err());
+        assert!(validated(|cfg| cfg.kill_hotkey = "ctrl+alt+f12".to_string()).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_escape_in_kill_hotkey() {
+        // Escape is the ABORT key sphinx itself sends; a kill hotkey on it
+        // would exit mid-abort. The combination form is rejected too.
+        assert!(validated(|cfg| cfg.kill_hotkey = "escape".to_string()).is_err());
+        assert!(validated(|cfg| cfg.kill_hotkey = "ctrl+escape".to_string()).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_process_names() {
+        let empty = |cfg: &mut Config| {
+            cfg.backend.window =
+                Some(WindowBackend { process_names: Vec::new(), title_filter: None });
+        };
+        assert!(validated(empty).is_err());
     }
 
     #[cfg(feature = "serial")]

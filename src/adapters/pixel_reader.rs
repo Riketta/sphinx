@@ -8,11 +8,14 @@ use std::time::{
 };
 
 use tracing::warn;
-use windows::Win32::Graphics::Gdi::{
-    GetDC,
-    GetPixel,
-    ReleaseDC,
-    HDC,
+use windows::Win32::{
+    Graphics::Gdi::{
+        GetDC,
+        GetPixel,
+        ReleaseDC,
+        HDC,
+    },
+    UI::WindowsAndMessaging::IsIconic,
 };
 
 use crate::{
@@ -87,13 +90,25 @@ impl PixelReader {
         }
     }
 
-    /// Samples any configured point. Returns exact RGB; `#000000` on failure.
+    /// Samples any configured point. Returns exact RGB; `#000000` on failure
+    /// (missing/minimized window or a point outside the client rect - reading
+    /// foreign pixels must never look like a semaphore color).
     pub fn read_point(&mut self, point: (i32, i32)) -> Rgb {
         let Some(info) = self.window() else {
             self.warn_limited("WoW window not found; pixels read as idle");
             return Rgb::BLACK;
         };
-        let Some((sx, sy)) = info.client_to_screen(point.0, point.1) else {
+        // SAFETY: read-only iconic-state query on the cached game window.
+        if unsafe { IsIconic(info.hwnd) }.as_bool() {
+            self.warn_limited("WoW is minimized; pixels read as idle");
+            return Rgb::BLACK;
+        }
+        let (x, y) = point;
+        if x < 0 || y < 0 || x >= info.client.0 || y >= info.client.1 {
+            self.warn_limited("configured point outside the client rect; pixel read as idle");
+            return Rgb::BLACK;
+        }
+        let Some((sx, sy)) = info.client_to_screen(x, y) else {
             self.warn_limited("ClientToScreen failed (window gone?); pixel read as idle");
             return Rgb::BLACK;
         };

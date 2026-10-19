@@ -39,14 +39,16 @@ use crate::{
 };
 
 /// How long one `OK` ack may take before the attempt counts as lost. The
-/// actuation contract budgets <=150 ms per press, so the ack window stays
-/// inside it.
+/// actuation contract budgets <=150 ms per press; the honest worst case for
+/// a round trip is the write plus this deadline plus one final
+/// [`READ_TIMEOUT`] read (160 ms), so a slow ack slightly overshoots the
+/// budget instead of ever blocking the loop indefinitely.
 const ACK_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// Per-`read` port timeout. Bounds how long a single stalled byte can block
 /// the poll loop (and with it the kill hotkey); the overall ack window is
 /// [`ACK_TIMEOUT`], enforced in `read_ok`.
-const READ_TIMEOUT: Duration = Duration::from_millis(25);
+const READ_TIMEOUT: Duration = Duration::from_millis(10);
 
 /// One command round-trip: send a line, wait for the `OK` ack. Abstracted so
 /// the ack/retry logic is testable without hardware.
@@ -57,6 +59,52 @@ trait LineLink {
     fn read_ok(&mut self) -> io::Result<()>;
 }
 
+/// Max accepted ack-line length (bytes before the `\n`); anything longer is
+/// protocol garbage, not an ack.
+const ACK_MAX_LINE: usize = 16;
+
+/// Why an accumulated ack line was rejected.
+#[derive(Debug, PartialEq, Eq)]
+enum AckLineError {
+    /// The line exceeded [`ACK_MAX_LINE`] bytes before its `\n`.
+    TooLong,
+}
+
+/// Accumulates one ack line byte-by-byte: `\n` terminates the line, `\r`
+/// is tolerated and stripped, and a line longer than [`ACK_MAX_LINE`] is
+/// rejected. Pure protocol logic (no I/O), split out of
+/// [`SerialLink::read_ok`] so the real parser is unit-testable.
+struct AckLine {
+    bytes: Vec<u8>,
+}
+
+impl AckLine {
+    fn new() -> Self {
+        Self { bytes: Vec::new() }
+    }
+
+    /// Feeds one ack byte. Returns the completed line when the terminating
+    /// `\n` arrived, or an error when the line ran past the length bound.
+    fn push(&mut self, byte: u8) -> Result<Option<&[u8]>, AckLineError> {
+        match byte {
+            b'\n' => return Ok(Some(&self.bytes)),
+            b'\r' => {}
+            _ => {
+                if self.bytes.len() >= ACK_MAX_LINE {
+                    return Err(AckLineError::TooLong);
+                }
+                self.bytes.push(byte);
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Whether a completed ack line is the protocol's `OK` ack.
+fn is_ok_line(line: &[u8]) -> bool {
+    line == b"OK"
+}
+
 /// Real link over a `serialport` handle.
 struct SerialLink {
     port: Box<dyn serialport::SerialPort>,
@@ -64,6 +112,11 @@ struct SerialLink {
 
 impl LineLink for SerialLink {
     fn send(&mut self, line: &str) -> io::Result<()> {
+        // Best-effort: drop any ack still in flight from a previous command
+        // so it cannot be consumed as *this* command's ack. A failure here
+        // only re-exposes that ordering risk; the write below still decides
+        // the command's outcome.
+        let _ = self.port.clear(serialport::ClearBuffer::Input);
         self.port.write_all(line.as_bytes())?;
         self.port.flush()
     }
@@ -74,7 +127,7 @@ impl LineLink for SerialLink {
         // alone would let a slow-drip device stall the poll loop for
         // bytes * port_timeout.
         let deadline = Instant::now() + ACK_TIMEOUT;
-        let mut line = Vec::new();
+        let mut line = AckLine::new();
         let mut byte = [0u8; 1];
         loop {
             if Instant::now() > deadline {
@@ -84,46 +137,57 @@ impl LineLink for SerialLink {
                 ));
             }
             self.port.read_exact(&mut byte)?;
-            if byte[0] == b'\n' {
-                break;
+            let completed = match line.push(byte[0]) {
+                Ok(completed) => completed,
+                Err(AckLineError::TooLong) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "serial ack line too long",
+                    ));
+                }
+            };
+            if let Some(text) = completed {
+                return if is_ok_line(text) {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unexpected serial ack {:?}", String::from_utf8_lossy(text)),
+                    ))
+                };
             }
-            if byte[0] != b'\r' {
-                line.push(byte[0]);
-            }
-            if line.len() > 16 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "serial ack line too long"));
-            }
-        }
-        if line == b"OK" {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unexpected serial ack {:?}", String::from_utf8_lossy(&line)),
-            ))
         }
     }
 }
 
-/// Sends one command line with the retry policy: a lost ack on the
-/// **idempotent** ping is resent once, then the command is given up on.
+/// Sends one command line with the retry policy: a **lost** ack (timeout)
+/// on the idempotent ping is resent once, then the command is given up on.
+/// Any other failure is returned without a resend - the device either
+/// heard the command (resending could double it) or the link is broken in
+/// a way no retry fixes.
 fn issue(link: &mut dyn LineLink, cmd: &str) -> io::Result<()> {
-    for attempt in 0..2 {
-        match link.send(cmd).and_then(|()| link.read_ok()) {
-            Ok(()) => {
-                info!(line = cmd.trim_end(), attempt, "serial command acked");
-                return Ok(());
-            }
-            Err(e) if attempt == 0 => {
-                warn!(error = %e, line = cmd.trim_end(), "serial command lost; retrying once");
-            }
-            Err(e) => {
-                warn!(error = %e, line = cmd.trim_end(), "serial command failed twice; skipping");
-                return Err(e);
-            }
+    let err = match link.send(cmd).and_then(|()| link.read_ok()) {
+        Ok(()) => {
+            info!(line = cmd.trim_end(), attempt = 0, "serial command acked");
+            return Ok(());
+        }
+        Err(e) => e,
+    };
+    if err.kind() != io::ErrorKind::TimedOut {
+        warn!(error = %err, line = cmd.trim_end(), "serial command failed; not retrying");
+        return Err(err);
+    }
+    warn!(error = %err, line = cmd.trim_end(), "serial command lost; retrying once");
+    match link.send(cmd).and_then(|()| link.read_ok()) {
+        Ok(()) => {
+            info!(line = cmd.trim_end(), attempt = 1, "serial command acked");
+            Ok(())
+        }
+        Err(e) => {
+            warn!(error = %e, line = cmd.trim_end(), "serial command failed twice; skipping");
+            Err(e)
         }
     }
-    Ok(())
 }
 
 /// Sends one actuation command **exactly once**. A lost ack means the MCU
@@ -182,11 +246,19 @@ impl Kbm for SerialKbm {
         let Some((sx, sy)) = self.guard.prepared_point("serial press", x, y) else {
             return;
         };
+        // Same TOCTOU re-check as the sendinput backend: the click must not
+        // land in whatever window took focus between check and send.
+        if !self.guard.still_prepared("serial press") {
+            return;
+        }
         let _ = issue_once(&mut self.link, &format!("C {sx} {sy}\n"));
     }
 
     fn key(&mut self, key: Key) {
         if !self.guard.prepared_key("serial key") {
+            return;
+        }
+        if !self.guard.still_prepared("serial key") {
             return;
         }
         let code = match key {
@@ -209,8 +281,11 @@ mod tests {
     };
 
     use super::{
+        is_ok_line,
         issue,
         issue_once,
+        AckLine,
+        AckLineError,
         LineLink,
     };
 
@@ -277,5 +352,82 @@ mod tests {
         let result = issue(&mut link, "P\n");
         assert!(result.is_err());
         assert_eq!(link.sent.len(), 2, "exactly one resend, then give up");
+    }
+
+    #[test]
+    fn non_timeout_failure_is_never_resent() {
+        // A non-timeout failure means the device either heard the command
+        // (resending could double it) or the link broke - no resend either
+        // way. This also pins the no-unreachable-tail restructure of
+        // `issue`.
+        let mut link = FakeLink {
+            acks: VecDeque::from([Err(io::Error::new(io::ErrorKind::InvalidData, "garbage"))]),
+            ..FakeLink::default()
+        };
+        let result = issue(&mut link, "P\n");
+        assert!(result.is_err());
+        assert_eq!(link.sent.len(), 1, "exactly one send for a non-timeout failure");
+    }
+
+    /// Drives [`AckLine`] with every byte of `input` and returns the last
+    /// outcome (what `read_ok` acts on at line end).
+    fn accumulate(input: &[u8]) -> Result<Option<Vec<u8>>, AckLineError> {
+        let mut line = AckLine::new();
+        let mut outcome = Ok(None);
+        for &byte in input {
+            outcome = line.push(byte).map(|completed| completed.map(<[u8]>::to_vec));
+            if outcome.is_err() {
+                break;
+            }
+        }
+        outcome
+    }
+
+    #[test]
+    fn ok_line_is_accepted() {
+        assert_eq!(accumulate(b"OK\n"), Ok(Some(b"OK".to_vec())));
+        assert!(is_ok_line(b"OK"));
+    }
+
+    #[test]
+    fn crlf_line_is_accepted() {
+        // CR is tolerated and stripped wherever it appears.
+        assert_eq!(accumulate(b"OK\r\n"), Ok(Some(b"OK".to_vec())));
+        assert_eq!(accumulate(b"\rOK\n"), Ok(Some(b"OK".to_vec())));
+        assert!(is_ok_line(b"OK"));
+    }
+
+    #[test]
+    fn non_ok_line_is_consumed_but_rejected() {
+        assert_eq!(accumulate(b"NO\n"), Ok(Some(b"NO".to_vec())));
+        assert!(!is_ok_line(b"NO"));
+        assert!(!is_ok_line(b""), "a bare newline is not an ack either");
+    }
+
+    #[test]
+    fn overlong_line_errors_without_panicking() {
+        // 16 bytes fit; the 17th refuses the line. `read_ok` surfaces that
+        // error immediately (each command parses into a fresh `AckLine`),
+        // so pushes after the error only need to stay panic-free.
+        assert_eq!(accumulate(&[b'A'; 16]), Ok(None));
+        assert_eq!(accumulate(&[b'A'; 17]), Err(AckLineError::TooLong));
+        let mut line = AckLine::new();
+        for byte in b"AAAAAAAAAAAAAAAA" {
+            assert_eq!(line.push(*byte), Ok(None));
+        }
+        assert_eq!(line.push(b'B'), Err(AckLineError::TooLong));
+        let _ = line.push(b'B');
+        let _ = line.push(b'\n');
+    }
+
+    #[test]
+    fn partial_line_completes_on_later_bytes() {
+        assert_eq!(accumulate(b"O"), Ok(None));
+        assert_eq!(accumulate(b"OK"), Ok(None));
+        assert_eq!(accumulate(b"O"), Ok(None));
+        let mut line = AckLine::new();
+        assert_eq!(line.push(b'O'), Ok(None));
+        assert_eq!(line.push(b'K'), Ok(None));
+        assert_eq!(line.push(b'\n'), Ok(Some(b"OK".as_slice())));
     }
 }
