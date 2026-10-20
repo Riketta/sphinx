@@ -53,3 +53,6 @@ kind = "sendinput"
 #                        # firmware 0.5+. "abs" = one absolute HID report
 #                        # (primary monitor only); "auto" = abs on the
 #                        # primary, closed loop elsewhere.
+# move_profile = "move-profile.toml"  # calibration written by
+#                        # `sphinx calibrate-move`; seeds the closed loop
+#                        # with your measured pointer-ballistics curve.
