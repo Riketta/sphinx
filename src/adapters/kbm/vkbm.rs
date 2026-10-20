@@ -24,6 +24,7 @@
 
 use std::{
     fmt,
+    path::Path,
     thread,
     time::{
         Duration,
@@ -34,12 +35,17 @@ use std::{
 };
 
 use anyhow::{
+    anyhow,
     bail,
     Context,
 };
 use hidapi::{
     HidApi,
     HidDevice,
+};
+use serde::{
+    Deserialize,
+    Serialize,
 };
 use tracing::{
     debug,
@@ -48,7 +54,14 @@ use tracing::{
 };
 use windows::Win32::{
     Foundation::POINT,
-    UI::WindowsAndMessaging::GetCursorPos,
+    UI::WindowsAndMessaging::{
+        GetCursorPos,
+        GetSystemMetrics,
+        SM_CXVIRTUALSCREEN,
+        SM_CYVIRTUALSCREEN,
+        SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    },
 };
 
 use crate::{
@@ -852,13 +865,14 @@ fn converge(
     pointer: &mut impl RelPointer,
     target: (i32, i32),
     deadline: Duration,
+    seed: &[(i32, f64)],
 ) -> Result<((i32, i32), u32), MoveError> {
     let started = Instant::now();
-    // The probe assumes 1:1; the per-axis measurements replace it.
+    // The probe assumes 1:1; the per-axis measurements replace it. Both
+    // axes start from the same calibration seed: the OS gain table is the
+    // same for x and y, and runtime samples then specialize each axis.
     let mut gain = (1.0_f64, 1.0_f64);
-    // Recent per-axis (size, gain) samples: the curve the corrections are
-    // sized against (see `PROFILE_SAMPLES`).
-    let mut profile = (Vec::<(i32, f64)>::new(), Vec::<(i32, f64)>::new());
+    let mut profile = (Vec::from(seed), Vec::from(seed));
     // Steps shrink when they overshoot the target (a gain misprediction)
     // and regrow when they land short - the contraction that walks out of
     // ballistics bucket boundaries instead of ping-ponging between them.
@@ -1017,6 +1031,10 @@ pub struct VkbmKbm {
     move_mode: MoveMode,
     /// Dry-run state at init, so `smoke_echo` restores it faithfully.
     dry_run_at_init: bool,
+    /// Calibration seed for the closed loop: (command counts, measured px
+    /// per count) from the most recent `calibrate-move` run. Empty when no
+    /// calibration file exists - the loop then learns within each move.
+    move_profile: Vec<(i32, f64)>,
 }
 
 impl VkbmKbm {
@@ -1030,6 +1048,7 @@ impl VkbmKbm {
     /// Device not found or not openable, no ack to the ping/info, protocol
     /// major mismatch, or a relative mode on firmware without the relative
     /// pointer.
+    #[allow(clippy::too_many_arguments)] // one value per config key
     pub fn new(
         vid: u16,
         pid: u16,
@@ -1038,67 +1057,17 @@ impl VkbmKbm {
         require_foreground: bool,
         focus_if_needed: bool,
         game: GameWindow,
+        move_profile: Vec<(i32, f64)>,
     ) -> anyhow::Result<Self> {
-        let api = HidApi::new().context("hidapi init")?;
-        let device_info = find_device(&api, vid, pid).with_context(|| {
-            format!("no versa-kbm vendor channel on {vid:04x}:{pid:04x} (plugged in? flashed?)")
-        })?;
-        let device = api.open_path(device_info.path()).context("opening the versa-kbm device")?;
-        let mut client = Client::new(device);
         let timeout = Duration::from_millis(ack_timeout_ms);
-
-        client
-            .request(wire::Cmd::Ping, timeout)
-            .map_err(request_error)
-            .context("versa-kbm did not ack the ping")?;
-        let reply = client
-            .request(wire::Cmd::Info, timeout)
-            .map_err(request_error)
-            .context("versa-kbm did not answer the info query")?;
-        let wire::Reply::Info { major, minor, flags } = reply else {
-            bail!("versa-kbm answered info with {reply:?}");
-        };
-        if major != PROTOCOL_MAJOR {
-            bail!(
-                "versa-kbm protocol mismatch: firmware v{major}.{minor}, this sphinx speaks \
-                 v{PROTOCOL_MAJOR}.x - flash a matching firmware"
-            );
-        }
-        if relative_requested(move_mode) && minor < RELATIVE_FW_MINOR {
-            bail!(
-                "versa-kbm firmware v{major}.{minor} predates the true relative pointer (needs \
-                 0.5+); flash a newer firmware or set backend.vkbm.move_mode = \"abs\""
-            );
-        }
-        let dry_run_at_init = flags & wire::info_flags::DRY_RUN != 0;
-        let switch = flags & wire::info_flags::SWITCH_ON != 0;
-        let armed = flags & wire::info_flags::ARMED != 0;
-        if !switch {
-            warn!(
-                "versa-kbm hardware switch is OFF - nothing will actuate until someone taps \
-                 BOOTSEL on the board (that is the point of the switch)"
-            );
-        } else if !armed {
-            warn!("versa-kbm is disarmed - run `vkbm arm` to re-enable actuation");
-        }
-        if dry_run_at_init {
-            warn!("versa-kbm dry-run is ON - actuation is echoed, not executed");
-        }
-        info!(
-            firmware = format!("v{major}.{minor}"),
-            vid = format!("{vid:04x}"),
-            pid = format!("{pid:04x}"),
-            switch,
-            armed,
-            dry_run = dry_run_at_init,
-            "versa-kbm link up (ping acked)"
-        );
+        let (client, dry_run_at_init) = open_link(vid, pid, timeout, move_mode)?;
         Ok(Self {
             guard: ActuationGuard::new(require_foreground, focus_if_needed, game),
             client,
             timeout,
             move_mode,
             dry_run_at_init,
+            move_profile,
         })
     }
 
@@ -1218,7 +1187,7 @@ impl VkbmKbm {
         }
         let (landed, nudges) = {
             let mut pointer = OsRelPointer { client: &mut self.client, timeout: self.timeout };
-            match converge(&mut pointer, (sx, sy), CONVERGE_DEADLINE) {
+            match converge(&mut pointer, (sx, sy), CONVERGE_DEADLINE, &self.move_profile) {
                 Ok(ok) => ok,
                 Err(MoveError::Stalled { err }) => {
                     warn!(
@@ -1318,6 +1287,221 @@ fn read_cursor() -> (i32, i32) {
     }
 }
 
+/// Opens the vendor control channel and handshakes: ping for liveness,
+/// info for the protocol version and device gate states. The protocol
+/// major must match; modes that move relatively additionally require the
+/// firmware minor that introduced the true relative pointer. Gate states
+/// are logged (they are bench-relevant facts, not errors). Returns the
+/// client and whether dry-run was on at init.
+fn open_link(
+    vid: u16,
+    pid: u16,
+    timeout: Duration,
+    move_mode: MoveMode,
+) -> anyhow::Result<(Client, bool)> {
+    let api = HidApi::new().context("hidapi init")?;
+    let device_info = find_device(&api, vid, pid).with_context(|| {
+        format!("no versa-kbm vendor channel on {vid:04x}:{pid:04x} (plugged in? flashed?)")
+    })?;
+    let device = api.open_path(device_info.path()).context("opening the versa-kbm device")?;
+    let mut client = Client::new(device);
+
+    client
+        .request(wire::Cmd::Ping, timeout)
+        .map_err(request_error)
+        .context("versa-kbm did not ack the ping")?;
+    let reply = client
+        .request(wire::Cmd::Info, timeout)
+        .map_err(request_error)
+        .context("versa-kbm did not answer the info query")?;
+    let wire::Reply::Info { major, minor, flags } = reply else {
+        bail!("versa-kbm answered info with {reply:?}");
+    };
+    if major != PROTOCOL_MAJOR {
+        bail!(
+            "versa-kbm protocol mismatch: firmware v{major}.{minor}, this sphinx speaks \
+             v{PROTOCOL_MAJOR}.x - flash a matching firmware"
+        );
+    }
+    if relative_requested(move_mode) && minor < RELATIVE_FW_MINOR {
+        bail!(
+            "versa-kbm firmware v{major}.{minor} predates the true relative pointer (needs \
+             0.5+); flash a newer firmware or set backend.vkbm.move_mode = \"abs\""
+        );
+    }
+    let dry_run_at_init = flags & wire::info_flags::DRY_RUN != 0;
+    let switch = flags & wire::info_flags::SWITCH_ON != 0;
+    let armed = flags & wire::info_flags::ARMED != 0;
+    if !switch {
+        warn!(
+            "versa-kbm hardware switch is OFF - nothing will actuate until someone taps \
+             BOOTSEL on the board (that is the point of the switch)"
+        );
+    } else if !armed {
+        warn!("versa-kbm is disarmed - run `vkbm arm` to re-enable actuation");
+    }
+    if dry_run_at_init {
+        warn!("versa-kbm dry-run is ON - actuation is echoed, not executed");
+    }
+    info!(
+        firmware = format!("v{major}.{minor}"),
+        vid = format!("{vid:04x}"),
+        pid = format!("{pid:04x}"),
+        switch,
+        armed,
+        dry_run = dry_run_at_init,
+        "versa-kbm link up (ping acked)"
+    );
+    Ok((client, dry_run_at_init))
+}
+
+/// Command sizes swept by [`calibrate_move`], in counts: dense across the
+/// single-report ramp (1..=127 counts is where the gain bends), sparse
+/// above - larger commands are chunked into <=127-count reports by the
+/// device, so their per-command gain is the flat large-report regime.
+const CALIBRATION_SIZES: [i32; 17] =
+    [1, 2, 3, 5, 8, 12, 18, 27, 40, 60, 90, 127, 180, 270, 405, 608, 912];
+
+/// Keep-out from the virtual desktop edges when sweeping, in px.
+const SWEEP_EDGE_MARGIN: i32 = 8;
+
+/// Virtual desktop bounds (left, top, right, bottom) in screen px.
+fn virtual_desktop_bounds() -> (i32, i32, i32, i32) {
+    // SAFETY: plain metric queries; no pointers, cannot fail.
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    }
+}
+
+/// Sweeps [`CALIBRATION_SIZES`] around the current cursor position and
+/// measures what the OS does to each command: move out by `k` counts,
+/// measure the landed px, move back (the return move is the same size
+/// and averaged in). Ping-pong keeps the cursor near the start; a size
+/// whose outward step would cross the desktop edge is measured in the
+/// other direction, or skipped when neither fits. Sizes whose sample
+/// moved 0 px (quantization at 1-2 counts) are dropped. Returns
+/// `(counts, px-per-count)` pairs, gains clamped to `GAIN_MIN..=GAIN_MAX`.
+///
+/// # Errors
+/// Link/handshake failures, a gate state that blocks actuation, or a lost
+/// ack mid-sweep.
+pub fn calibrate_move(vid: u16, pid: u16, ack_timeout_ms: u64) -> anyhow::Result<Vec<(i32, f64)>> {
+    let timeout = Duration::from_millis(ack_timeout_ms);
+    let (mut client, dry_run_at_init) = open_link(vid, pid, timeout, MoveMode::Relative)?;
+    if dry_run_at_init {
+        bail!("versa-kbm dry-run is on - run `vkbm dry-run off` before calibrating");
+    }
+    let mut pointer = OsRelPointer { client: &mut client, timeout };
+    let (left, _, right, _) = virtual_desktop_bounds();
+    info!(
+        sizes = CALIBRATION_SIZES.len(),
+        bounds = ?(left, right),
+        "calibrate-move: sweeping (the cursor will wiggle around its current spot)"
+    );
+    let mut samples = Vec::with_capacity(CALIBRATION_SIZES.len());
+    for &k in &CALIBRATION_SIZES {
+        let (x, _) = pointer.read();
+        // Sweep outward on x where there is room, else in the other
+        // direction; y stays put (the OS gain table is the same for both
+        // axes, so one axis measures it for both).
+        let dir = if x + k <= right - SWEEP_EDGE_MARGIN {
+            1
+        } else if x - k >= left + SWEEP_EDGE_MARGIN {
+            -1
+        } else {
+            warn!(counts = k, "calibrate-move: no room on either side, skipping");
+            continue;
+        };
+        let mut gains = Vec::new();
+        for &d in &[dir, -dir] {
+            let before = pointer.read();
+            if matches!(
+                pointer.nudge(i16::try_from(d * k).unwrap_or(0), 0).map_err(|e| anyhow!("{e}"))?,
+                Nudged::Echoed
+            ) {
+                bail!("versa-kbm dry-run turned on mid-sweep");
+            }
+            let after = pointer.read();
+            let moved = (after.0 - before.0).abs();
+            if moved > 0 {
+                gains.push(f64::from(moved) / f64::from(k));
+            }
+        }
+        if gains.is_empty() {
+            debug!(counts = k, "calibrate-move: sample moved 0 px, dropped");
+            continue;
+        }
+        // At most two measurements per size (out + back).
+        let gain = gains.iter().sum::<f64>()
+            / match gains.len() {
+                1 => 1.0_f64,
+                _ => 2.0,
+            };
+        let gain = gain.clamp(GAIN_MIN, GAIN_MAX);
+        info!(counts = k, px_per_count = gain, "calibrate-move: sample");
+        samples.push((k, gain));
+    }
+    Ok(samples)
+}
+
+/// The `move-profile.toml` document: parallel arrays of command size
+/// (counts) and measured px-per-count, written by `sphinx calibrate-move`.
+#[derive(Serialize, Deserialize)]
+struct MoveProfileFile {
+    counts: Vec<i32>,
+    gain: Vec<f64>,
+}
+
+/// Loads a move-calibration file written by `calibrate-move`. A missing
+/// file is an empty profile (the loop learns live); a corrupt one warns
+/// and degrades to empty rather than refusing to start.
+pub fn load_move_profile(path: &Path) -> Vec<(i32, f64)> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "move profile unreadable; starting uncalibrated"
+            );
+            return Vec::new();
+        }
+    };
+    match toml::from_str::<MoveProfileFile>(&raw) {
+        Ok(file) if file.counts.len() == file.gain.len() => {
+            file.counts.into_iter().zip(file.gain).collect()
+        }
+        Ok(_) => {
+            warn!(path = %path.display(), "move profile arrays disagree in length; ignored");
+            Vec::new()
+        }
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "move profile unparsable; ignored");
+            Vec::new()
+        }
+    }
+}
+
+/// Writes a move-calibration file (see [`load_move_profile`]).
+///
+/// # Errors
+/// Any filesystem failure on write/serialize.
+pub fn save_move_profile(path: &Path, samples: &[(i32, f64)]) -> anyhow::Result<()> {
+    let file = MoveProfileFile {
+        counts: samples.iter().map(|&(c, _)| c).collect(),
+        gain: samples.iter().map(|&(_, g)| g).collect(),
+    };
+    let raw = toml::to_string_pretty(&file).context("serializing the move profile")?;
+    std::fs::write(path, raw).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1326,8 +1510,10 @@ mod tests {
         converge,
         initial_seq,
         issue,
+        load_move_profile,
         point_in_primary,
         relative_requested,
+        save_move_profile,
         scale_axis,
         step_axis,
         to_abs,
@@ -1781,7 +1967,7 @@ mod tests {
     #[test]
     fn converges_in_one_probe_at_unit_gain() -> Result<(), MoveError> {
         let mut p = FakePointer::at((100, 100), unit);
-        let (pos, nudges) = converge(&mut p, (500, 500), CONVERGE_DEADLINE)?;
+        let (pos, nudges) = converge(&mut p, (500, 500), CONVERGE_DEADLINE, &[])?;
         assert_eq!(pos, (500, 500));
         assert_eq!(nudges, 1, "1:1 ballistics: the probe lands exactly");
         Ok(())
@@ -1790,7 +1976,7 @@ mod tests {
     #[test]
     fn converges_at_half_gain() -> Result<(), MoveError> {
         let mut p = FakePointer::at((0, 0), half);
-        let (pos, nudges) = converge(&mut p, (400, 200), CONVERGE_DEADLINE)?;
+        let (pos, nudges) = converge(&mut p, (400, 200), CONVERGE_DEADLINE, &[])?;
         assert!(
             (pos.0 - 400).abs() <= CONVERGE_TOLERANCE_PX
                 && (pos.1 - 200).abs() <= CONVERGE_TOLERANCE_PX,
@@ -1803,7 +1989,7 @@ mod tests {
     #[test]
     fn converges_at_max_pointer_speed_gain() -> Result<(), MoveError> {
         let mut p = FakePointer::at((0, 0), uniform_ten);
-        let (pos, nudges) = converge(&mut p, (1000, 300), CONVERGE_DEADLINE)?;
+        let (pos, nudges) = converge(&mut p, (1000, 300), CONVERGE_DEADLINE, &[])?;
         assert!(
             (pos.0 - 1000).abs() <= CONVERGE_TOLERANCE_PX
                 && (pos.1 - 300).abs() <= CONVERGE_TOLERANCE_PX,
@@ -1816,7 +2002,7 @@ mod tests {
     #[test]
     fn converges_through_epp_style_curve() -> Result<(), MoveError> {
         let mut p = FakePointer::at((0, 0), epp_like);
-        let (pos, nudges) = converge(&mut p, (1000, 400), CONVERGE_DEADLINE)?;
+        let (pos, nudges) = converge(&mut p, (1000, 400), CONVERGE_DEADLINE, &[])?;
         assert!(
             (pos.0 - 1000).abs() <= CONVERGE_TOLERANCE_PX
                 && (pos.1 - 400).abs() <= CONVERGE_TOLERANCE_PX,
@@ -1842,7 +2028,7 @@ mod tests {
         // The full-distance probe plus per-axis adapted corrections must
         // still land from a desktop away.
         let mut p = FakePointer::at((-4000, -2000), chunk_bucketed);
-        let (pos, nudges) = converge(&mut p, (330, 450), CONVERGE_DEADLINE)?;
+        let (pos, nudges) = converge(&mut p, (330, 450), CONVERGE_DEADLINE, &[])?;
         assert!(
             (pos.0 - 330).abs() <= CONVERGE_TOLERANCE_PX
                 && (pos.1 - 450).abs() <= CONVERGE_TOLERANCE_PX,
@@ -1865,7 +2051,7 @@ mod tests {
     #[test]
     fn overshooting_bucket_boundary_damps_then_lands() -> Result<(), MoveError> {
         let mut p = FakePointer::at((0, 0), bouncing_bucket);
-        let (pos, nudges) = converge(&mut p, (100, 0), CONVERGE_DEADLINE)?;
+        let (pos, nudges) = converge(&mut p, (100, 0), CONVERGE_DEADLINE, &[])?;
         assert!((pos.0 - 100).abs() <= CONVERGE_TOLERANCE_PX, "got {pos:?} after {nudges} nudges");
         assert!(
             p.nudges.iter().any(|&(dx, _)| i32::from(dx).abs() < 50),
@@ -1874,12 +2060,50 @@ mod tests {
         Ok(())
     }
 
+    /// A live-world-shaped curve (the shape the bench sweep measured).
+    fn live_shaped(speed: i32) -> f64 {
+        match speed.abs() {
+            0..=4 => 0.5,
+            5..=11 => 1.0,
+            12..=47 => 1.65,
+            _ => 2.5,
+        }
+    }
+
+    #[test]
+    fn move_profile_roundtrips_through_toml() -> anyhow::Result<()> {
+        let samples = vec![(1_i32, 0.5), (127, 2.5), (912, 2.4)];
+        let path =
+            std::env::temp_dir().join(format!("sphinx-move-profile-{}.toml", std::process::id()));
+        save_move_profile(&path, &samples)?;
+        let loaded = load_move_profile(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded, samples);
+        Ok(())
+    }
+
+    #[test]
+    fn calibration_seed_lands_the_first_corrections() -> Result<(), MoveError> {
+        // What `calibrate-move` writes: the curve, pre-measured. The very
+        // first correction must already size right - no learning nudges.
+        let mut p = FakePointer::at((0, 0), live_shaped);
+        let seed = [(127_i32, 2.5), (64, 2.5), (20, 1.65), (8, 1.0), (3, 0.5)];
+        let (pos, nudges) = converge(&mut p, (1000, 400), CONVERGE_DEADLINE, &seed)?;
+        assert!(
+            (pos.0 - 1000).abs() <= CONVERGE_TOLERANCE_PX
+                && (pos.1 - 400).abs() <= CONVERGE_TOLERANCE_PX,
+            "got {pos:?} after {nudges} nudges"
+        );
+        assert!(nudges <= 5, "a seeded curve must not need learning nudges: {nudges}");
+        Ok(())
+    }
+
     #[test]
     fn flat_extreme_gain_stalls_instead_of_clicking_wild() {
         // 20x on 1-count sends means sub-pixel targets are unreachable; the
         // loop must refuse to click rather than guess.
         let mut p = FakePointer::at((0, 0), flat_twenty);
-        let outcome = converge(&mut p, (3, 0), CONVERGE_DEADLINE);
+        let outcome = converge(&mut p, (3, 0), CONVERGE_DEADLINE, &[]);
         assert!(matches!(outcome, Err(MoveError::Stalled { .. })));
     }
 
@@ -1887,7 +2111,7 @@ mod tests {
     fn pinned_cursor_reports_pinned() {
         let mut p = FakePointer::at((0, 0), unit);
         p.inert = true;
-        let outcome = converge(&mut p, (300, 300), CONVERGE_DEADLINE);
+        let outcome = converge(&mut p, (300, 300), CONVERGE_DEADLINE, &[]);
         assert!(matches!(outcome, Err(MoveError::Pinned)));
     }
 
@@ -1895,7 +2119,7 @@ mod tests {
     fn lost_ack_during_move_aborts_the_click() {
         let mut p = FakePointer::at((0, 0), unit);
         p.fail = Some(MoveError::Lost);
-        let outcome = converge(&mut p, (300, 300), CONVERGE_DEADLINE);
+        let outcome = converge(&mut p, (300, 300), CONVERGE_DEADLINE, &[]);
         assert!(matches!(outcome, Err(MoveError::Lost)));
     }
 
@@ -1905,7 +2129,7 @@ mod tests {
         // must say "dry-run", not misreport a pinned cursor.
         let mut p = FakePointer::at((0, 0), unit);
         p.dry_run = true;
-        let outcome = converge(&mut p, (300, 300), CONVERGE_DEADLINE);
+        let outcome = converge(&mut p, (300, 300), CONVERGE_DEADLINE, &[]);
         assert!(matches!(outcome, Err(MoveError::DryRun)), "got {outcome:?}");
     }
 
@@ -1931,7 +2155,7 @@ mod tests {
     #[test]
     fn exhausted_deadline_stalls() {
         let mut p = FakePointer::at((0, 0), unit);
-        let outcome = converge(&mut p, (300, 300), Duration::ZERO);
+        let outcome = converge(&mut p, (300, 300), Duration::ZERO, &[]);
         assert!(matches!(outcome, Err(MoveError::Stalled { .. })));
     }
 

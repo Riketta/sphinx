@@ -79,6 +79,10 @@ fn d_vkbm_ack_timeout_ms() -> u64 {
     250
 }
 
+fn d_vkbm_move_profile() -> String {
+    "move-profile.toml".to_string()
+}
+
 /// A client-area physical pixel point (§3.7).
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -222,6 +226,13 @@ pub struct VkbmBackend {
     /// Pointer placement strategy (see [`MoveMode`]).
     #[serde(default)]
     pub move_mode: MoveMode,
+    /// Move-calibration file (written by `sphinx calibrate-move`) that
+    /// seeds the closed loop with the measured OS ballistics curve;
+    /// relative to the working directory. Absent file = uncalibrated
+    /// (the loop learns within each move).
+    #[serde(default = "d_vkbm_move_profile")]
+    #[cfg_attr(not(feature = "vkbm"), allow(dead_code))]
+    pub move_profile: String,
 }
 
 impl Default for VkbmBackend {
@@ -231,6 +242,7 @@ impl Default for VkbmBackend {
             pid: d_vkbm_pid(),
             ack_timeout_ms: d_vkbm_ack_timeout_ms(),
             move_mode: MoveMode::default(),
+            move_profile: d_vkbm_move_profile(),
         }
     }
 }

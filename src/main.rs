@@ -1,6 +1,8 @@
 //! Composition root + CLI: the only place naming concrete adapter types.
 //! Everything below `domain`/`ports` works through traits.
 
+#[cfg(feature = "vkbm")]
+use std::path::Path;
 use std::{
     path::PathBuf,
     thread,
@@ -42,6 +44,12 @@ mod config;
 mod domain;
 mod ports;
 
+#[cfg(feature = "vkbm")]
+use crate::adapters::kbm::vkbm::{
+    calibrate_move,
+    load_move_profile,
+    save_move_profile,
+};
 #[cfg(feature = "serial")]
 use crate::adapters::kbm::SerialKbm;
 #[cfg(feature = "vkbm")]
@@ -209,6 +217,10 @@ enum Cmd {
     },
     /// Sample the configured points at 1 Hz (alignment aid).
     Calibrate,
+    /// Sweep the OS pointer-ballistics curve with the vkbm board and write
+    /// the move profile the closed loop seeds from (feature `vkbm`).
+    #[cfg(feature = "vkbm")]
+    CalibrateMove,
     /// Actuate one press at screen coordinates (bench: exercises the real
     /// backend's movement and click path exactly as `run` would).
     Press {
@@ -237,6 +249,8 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Cmd::Run { dry_run } => run(&cfg, dry_run),
         Cmd::Calibrate => calibrate(&cfg),
+        #[cfg(feature = "vkbm")]
+        Cmd::CalibrateMove => calibrate_move_cmd(&cfg),
         Cmd::Press { x, y } => press_once(&cfg, x, y),
         Cmd::Doctor { smoke } => doctor(&cfg, smoke),
     }
@@ -322,6 +336,20 @@ fn build_kbm(cfg: &Config, dry_run: bool, game: GameWindow) -> anyhow::Result<An
         #[cfg(feature = "vkbm")]
         {
             let vkbm = cfg.backend.vkbm.clone().unwrap_or_default();
+            let move_profile = load_move_profile(Path::new(&vkbm.move_profile));
+            if move_profile.is_empty() {
+                info!(
+                    path = %vkbm.move_profile,
+                    "vkbm: no move profile - the closed loop learns each move (run `sphinx \
+                     calibrate-move` to seed it)"
+                );
+            } else {
+                info!(
+                    path = %vkbm.move_profile,
+                    samples = move_profile.len(),
+                    "vkbm: move profile loaded"
+                );
+            }
             return Ok(AnyKbm::Vkbm(
                 VkbmKbm::new(
                     vkbm.vid,
@@ -331,6 +359,7 @@ fn build_kbm(cfg: &Config, dry_run: bool, game: GameWindow) -> anyhow::Result<An
                     cfg.require_foreground,
                     cfg.focus_if_needed,
                     game.clone(),
+                    move_profile,
                 )
                 .context("vkbm link init failed")?,
             ));
@@ -464,6 +493,26 @@ fn press_once(cfg: &Config, x: i32, y: i32) -> anyhow::Result<()> {
     let mut kbm = build_kbm(cfg, false, game)?;
     info!(x, y, "press: bench actuation");
     kbm.press(x, y);
+    Ok(())
+}
+
+/// Sweeps the OS pointer-ballistics curve with the vkbm board and writes
+/// the move profile the closed loop seeds from. Real cursor movement: run
+/// it with the pointer somewhere with room on both sides (screen middle).
+#[cfg(feature = "vkbm")]
+fn calibrate_move_cmd(cfg: &Config) -> anyhow::Result<()> {
+    let vkbm = cfg.backend.vkbm.clone().unwrap_or_default();
+    let samples = calibrate_move(vkbm.vid, vkbm.pid, vkbm.ack_timeout_ms)?;
+    for (counts, gain) in &samples {
+        info!(counts, px_per_count = gain, "sample");
+    }
+    let path = PathBuf::from(&vkbm.move_profile);
+    save_move_profile(&path, &samples)?;
+    info!(
+        path = %path.display(),
+        samples = samples.len(),
+        "move profile saved (loaded automatically on the next vkbm start)"
+    );
     Ok(())
 }
 
@@ -743,6 +792,7 @@ fn doctor_vkbm_link(cfg: &Config, smoke: bool) -> anyhow::Result<usize> {
         cfg.require_foreground,
         cfg.focus_if_needed,
         GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref()),
+        load_move_profile(Path::new(&vkbm.move_profile)),
     ) {
         Ok(kbm) => kbm,
         Err(e) => {
