@@ -47,8 +47,10 @@ impl Hotkey {
                      delete, home, end, pageup, pagedown, capslock, numlock, scrolllock, menu)"
                 ));
             };
-            let is_modifier =
-                matches!(name.as_str(), "ctrl" | "control" | "alt" | "shift" | "win" | "super");
+            let is_modifier = matches!(
+                name.as_str(),
+                "ctrl" | "control" | "alt" | "menu" | "shift" | "win" | "super"
+            );
             all_modifiers &= is_modifier;
             has_modifier |= is_modifier;
             let alt = if name == "win" || name == "super" { Some(VK_RWIN) } else { None };

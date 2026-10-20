@@ -26,9 +26,13 @@ use tracing::{
     warn,
 };
 
+use super::point_in_primary;
 use crate::{
     adapters::{
-        game_window::GameWindow,
+        game_window::{
+            screen_size,
+            GameWindow,
+        },
         hotkey::VK_ESCAPE,
         kbm::guard::ActuationGuard,
     },
@@ -249,6 +253,19 @@ impl Kbm for SerialKbm {
         // Same TOCTOU re-check as the sendinput backend: the click must not
         // land in whatever window took focus between check and send.
         if !self.guard.still_prepared("serial press") {
+            return;
+        }
+        // The MCU's absolute HID report is normalized across the primary
+        // display only, exactly like the vkbm absolute fast path - a target
+        // outside it would land on whatever window is there instead.
+        if !point_in_primary((sx, sy), screen_size()) {
+            warn!(
+                action = "press",
+                screen_x = sx,
+                screen_y = sy,
+                "target outside the primary monitor - the serial backend's absolute reports \
+                 cannot reach it; skipping (make WoW the primary display)"
+            );
             return;
         }
         let _ = issue_once(&mut self.link, &format!("C {sx} {sy}\n"));

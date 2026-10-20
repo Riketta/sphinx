@@ -488,6 +488,11 @@ fn calibrate(cfg: &Config) -> anyhow::Result<()> {
 /// uses, driven directly instead of by a semaphore edge. The click is real.
 fn press_once(cfg: &Config, x: i32, y: i32) -> anyhow::Result<()> {
     cfg.validate()?;
+    // The bench click is real, and unlike `run` the bench commands normally
+    // run one-shot: the mutex keeps two actuating sessions out of each
+    // other's device sequence space (a colliding seq could draw a cached,
+    // silent no-op reply instead of executing).
+    let _instance = acquire_instance_mutex()?;
     let game = GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref());
     warn_once_if_elevation_mismatch(&game);
     let mut kbm = build_kbm(cfg, false, game)?;
@@ -501,6 +506,11 @@ fn press_once(cfg: &Config, x: i32, y: i32) -> anyhow::Result<()> {
 /// it with the pointer somewhere with room on both sides (screen middle).
 #[cfg(feature = "vkbm")]
 fn calibrate_move_cmd(cfg: &Config) -> anyhow::Result<()> {
+    cfg.validate()?;
+    // The sweep wiggles the real cursor for about a second; the mutex keeps
+    // a live `run` session (which owns the device's sequence space) out of
+    // it.
+    let _instance = acquire_instance_mutex()?;
     let vkbm = cfg.backend.vkbm.clone().unwrap_or_default();
     let samples = calibrate_move(vkbm.vid, vkbm.pid, vkbm.ack_timeout_ms)?;
     for (counts, gain) in &samples {
@@ -530,6 +540,10 @@ fn doctor(cfg: &Config, smoke: bool) -> anyhow::Result<()> {
     #[cfg(feature = "vkbm")]
     {
         failures += doctor_vkbm_placement(cfg);
+    }
+    #[cfg(feature = "serial")]
+    {
+        failures += doctor_serial_placement(cfg);
     }
     #[cfg(feature = "vkbm")]
     if cfg.backend.kind == BackendKind::Vkbm {
@@ -709,7 +723,8 @@ fn doctor_kill(cfg: &Config) {
     match Hotkey::parse(&cfg.kill_hotkey) {
         Ok(kill) => info!(
             kill = kill.spec(),
-            "kill: hold to exit within one poll (GetAsyncKeyState, no hook)"
+            "kill: hold to exit - checked every poll, but an in-flight actuation (a relative \
+             move: worst case ~2 s) finishes first (GetAsyncKeyState, no hook)"
         ),
         Err(e) => warn!("kill: {e}"),
     }
@@ -774,6 +789,51 @@ fn doctor_vkbm_placement(cfg: &Config) -> usize {
              relative path reaches it"
         );
         0
+    }
+}
+
+/// Returns 1 only when the game window lies outside the primary monitor.
+/// Serial variant of [`doctor_vkbm_placement`]: the UART backend's absolute
+/// reports have no relative fallback, so off-primary placement is always a
+/// failure.
+#[cfg(feature = "serial")]
+fn doctor_serial_placement(cfg: &Config) -> usize {
+    if cfg.backend.kind != BackendKind::Serial {
+        return 0;
+    }
+    // A missing window is doctor_window's finding; placement needs one.
+    let Some(info) =
+        GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref()).find()
+    else {
+        return 0;
+    };
+    let Some((ox, oy)) = info.client_to_screen(0, 0) else {
+        warn!("serial placement: could not locate the game window on the desktop");
+        return 1;
+    };
+    let (w, h) = screen_size();
+    let inside = ox >= 0 && oy >= 0 && ox + info.client.0 <= w && oy + info.client.1 <= h;
+    if inside {
+        info!(
+            origin_x = ox,
+            origin_y = oy,
+            primary_width = w,
+            primary_height = h,
+            "serial placement: game window on the primary monitor"
+        );
+        0
+    } else {
+        warn!(
+            origin_x = ox,
+            origin_y = oy,
+            client_width = info.client.0,
+            client_height = info.client.1,
+            primary_width = w,
+            primary_height = h,
+            "serial placement: game window outside the primary monitor - absolute UART reports \
+             cannot reach it, actuation will be skipped; make the WoW display the primary display"
+        );
+        1
     }
 }
 

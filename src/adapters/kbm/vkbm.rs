@@ -70,7 +70,10 @@ use crate::{
             screen_size,
             GameWindow,
         },
-        kbm::guard::ActuationGuard,
+        kbm::{
+            guard::ActuationGuard,
+            point_in_primary,
+        },
     },
     config::MoveMode,
     ports::{
@@ -236,7 +239,11 @@ mod wire {
             /// HID keyboard usage code.
             usage: u8,
         },
-        /// Moves the pointer to an absolute position.
+        /// Moves the pointer to an absolute position. No production sender
+        /// today - the press path uses [`Cmd::ClickAbs`] and the smoke probe
+        /// was moved to a zero-delta [`Cmd::MoveRel`] - but the variant stays
+        /// for mirror completeness with `vkbm-proto` (and codec tests).
+        #[expect(dead_code)]
         MoveAbs {
             /// Absolute X, `0..=32767`.
             x: u16,
@@ -681,13 +688,6 @@ fn to_abs(v: i32, dim: i32) -> u16 {
     u16::try_from(scaled).unwrap_or(ABS_MAX)
 }
 
-/// Whether a screen point lies on the primary monitor - the only surface
-/// the OS scales HID absolute reports across.
-#[must_use]
-fn point_in_primary(p: (i32, i32), primary: (i32, i32)) -> bool {
-    p.0 >= 0 && p.0 < primary.0 && p.1 >= 0 && p.1 < primary.1
-}
-
 /// Interprets an actuation outcome: `Ok` and dry-run `Echo` are both
 /// success; a lost ack is logged loudly but never retried (the dedup keeps
 /// a resent frame from executing twice, so a retry could only double-send).
@@ -1073,8 +1073,11 @@ impl VkbmKbm {
 
     /// Dry-run echo round-trip for `doctor --smoke`: turns the device's
     /// dry-run on (a configuration command; no gate involvement), sends one
-    /// absolute move and expects [`wire::Reply::Echo`] - the full command
-    /// path runs while nothing is physically actuated. Restores the prior
+    /// zero-delta relative move and expects [`wire::Reply::Echo`] - the full
+    /// command path runs while nothing is physically actuated, and the zero
+    /// delta means not even a pointer report is emitted (unlike the
+    /// previous `MoveAbs {0, 0}` probe, which visibly threw the cursor to
+    /// the top-left corner if dry-run failed to latch). Restores the prior
     /// dry-run state; a gate rejection (`Disabled`/`Disarmed`) surfaces with
     /// its hint, which is exactly what the doctor should report.
     ///
@@ -1085,7 +1088,7 @@ impl VkbmKbm {
             .request(wire::Cmd::DryRun { enabled: true }, self.timeout)
             .map_err(request_error)
             .context("enabling device dry-run")?;
-        let outcome = self.client.request(wire::Cmd::MoveAbs { x: 0, y: 0 }, self.timeout);
+        let outcome = self.client.request(wire::Cmd::MoveRel { dx: 0, dy: 0 }, self.timeout);
         // Restore first, report second: a bench session with dry-run on must
         // not silently end up actuating because of a doctor run.
         if !self.dry_run_at_init {
@@ -1365,16 +1368,36 @@ const CALIBRATION_SIZES: [i32; 17] =
 /// Keep-out from the virtual desktop edges when sweeping, in px.
 const SWEEP_EDGE_MARGIN: i32 = 8;
 
-/// Virtual desktop bounds (left, top, right, bottom) in screen px.
+/// Virtual desktop bounds (left, top, right, bottom) in screen px. The
+/// `SM_C*`/`SM_Y*` metrics are the origin and the *size*, so the edges are
+/// computed here - consuming the sizes as edge coordinates only works when
+/// the desktop origin is (0, 0), which a monitor left of / above the primary
+/// breaks.
 fn virtual_desktop_bounds() -> (i32, i32, i32, i32) {
     // SAFETY: plain metric queries; no pointers, cannot fail.
     unsafe {
+        let (left, top) =
+            (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
         (
-            GetSystemMetrics(SM_XVIRTUALSCREEN),
-            GetSystemMetrics(SM_YVIRTUALSCREEN),
-            GetSystemMetrics(SM_CXVIRTUALSCREEN),
-            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            left,
+            top,
+            left + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            top + GetSystemMetrics(SM_CYVIRTUALSCREEN),
         )
+    }
+}
+
+/// Outward sweep direction for a size-`k` probe at `x`: right when the
+/// outward step fits inside the desktop, else left, else `None` when neither
+/// side has room (the caller skips that size).
+#[must_use]
+fn sweep_dir(x: i32, k: i32, left: i32, right: i32) -> Option<i32> {
+    if x + k <= right - SWEEP_EDGE_MARGIN {
+        Some(1)
+    } else if x - k >= left + SWEEP_EDGE_MARGIN {
+        Some(-1)
+    } else {
+        None
     }
 }
 
@@ -1409,11 +1432,7 @@ pub fn calibrate_move(vid: u16, pid: u16, ack_timeout_ms: u64) -> anyhow::Result
         // Sweep outward on x where there is room, else in the other
         // direction; y stays put (the OS gain table is the same for both
         // axes, so one axis measures it for both).
-        let dir = if x + k <= right - SWEEP_EDGE_MARGIN {
-            1
-        } else if x - k >= left + SWEEP_EDGE_MARGIN {
-            -1
-        } else {
+        let Some(dir) = sweep_dir(x, k, left, right) else {
             warn!(counts = k, "calibrate-move: no room on either side, skipping");
             continue;
         };
@@ -1516,6 +1535,7 @@ mod tests {
         save_move_profile,
         scale_axis,
         step_axis,
+        sweep_dir,
         to_abs,
         wait_ack,
         wants_relative,
@@ -2080,6 +2100,47 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(loaded, samples);
         Ok(())
+    }
+
+    #[test]
+    fn move_profile_unparsable_degrades_to_empty() {
+        let path = std::env::temp_dir()
+            .join(format!("sphinx-move-profile-corrupt-{}.toml", std::process::id()));
+        let written = std::fs::write(&path, "counts = [1, 2\ngain = nope");
+        assert!(written.is_ok(), "temp write failed");
+        let loaded = load_move_profile(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(loaded.is_empty(), "a corrupt profile must be ignored, got {loaded:?}");
+    }
+
+    #[test]
+    fn move_profile_length_mismatch_degrades_to_empty() {
+        let path = std::env::temp_dir()
+            .join(format!("sphinx-move-profile-mismatch-{}.toml", std::process::id()));
+        let written = std::fs::write(&path, "counts = [1, 2]\ngain = [1.0]\n");
+        assert!(written.is_ok(), "temp write failed");
+        let loaded = load_move_profile(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(loaded.is_empty(), "mismatched arrays must be ignored, got {loaded:?}");
+    }
+
+    // --- calibration sweep bounds ---
+
+    #[test]
+    fn sweep_direction_prefers_right_when_it_fits() {
+        assert_eq!(sweep_dir(100, 50, 0, 1920), Some(1));
+        assert_eq!(sweep_dir(100, 50, -1920, 1920), Some(1), "non-zero origin desktop");
+    }
+
+    #[test]
+    fn sweep_direction_falls_back_to_left_at_the_edge() {
+        assert_eq!(sweep_dir(1900, 50, 0, 1920), Some(-1));
+        assert_eq!(sweep_dir(1900, 50, -1920, 1920), Some(-1));
+    }
+
+    #[test]
+    fn sweep_direction_skips_when_neither_side_fits() {
+        assert_eq!(sweep_dir(10, 50, 0, 20), None);
     }
 
     #[test]

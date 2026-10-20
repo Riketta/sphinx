@@ -15,3 +15,12 @@ pub use sendinput::SendInputKbm;
 pub use serial::SerialKbm;
 #[cfg(feature = "vkbm")]
 pub use vkbm::VkbmKbm;
+
+/// Whether a screen point lies on the primary monitor - the only surface the
+/// OS scales HID absolute reports across (the serial backend's `C` lines and
+/// the vkbm absolute fast path both normalize this way).
+#[cfg(any(feature = "serial", feature = "vkbm"))]
+#[must_use]
+pub fn point_in_primary(p: (i32, i32), primary: (i32, i32)) -> bool {
+    p.0 >= 0 && p.0 < primary.0 && p.1 >= 0 && p.1 < primary.1
+}
