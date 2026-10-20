@@ -209,6 +209,14 @@ enum Cmd {
     },
     /// Sample the configured points at 1 Hz (alignment aid).
     Calibrate,
+    /// Actuate one press at screen coordinates (bench: exercises the real
+    /// backend's movement and click path exactly as `run` would).
+    Press {
+        /// Screen X.
+        x: i32,
+        /// Screen Y.
+        y: i32,
+    },
     /// Environment checks: DPI, window, screen, pixels, foreground, hotkey.
     Doctor {
         /// Also move the pointer by 1 px and back (on-request smoke test).
@@ -229,6 +237,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Cmd::Run { dry_run } => run(&cfg, dry_run),
         Cmd::Calibrate => calibrate(&cfg),
+        Cmd::Press { x, y } => press_once(&cfg, x, y),
         Cmd::Doctor { smoke } => doctor(&cfg, smoke),
     }
 }
@@ -444,6 +453,18 @@ fn calibrate(cfg: &Config) -> anyhow::Result<()> {
         );
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// One bench press through the real backend: the same guarded path `run`
+/// uses, driven directly instead of by a semaphore edge. The click is real.
+fn press_once(cfg: &Config, x: i32, y: i32) -> anyhow::Result<()> {
+    cfg.validate()?;
+    let game = GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref());
+    warn_once_if_elevation_mismatch(&game);
+    let mut kbm = build_kbm(cfg, false, game)?;
+    info!(x, y, "press: bench actuation");
+    kbm.press(x, y);
+    Ok(())
 }
 
 fn doctor(cfg: &Config, smoke: bool) -> anyhow::Result<()> {

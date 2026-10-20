@@ -42,6 +42,7 @@ use hidapi::{
     HidDevice,
 };
 use tracing::{
+    debug,
     info,
     warn,
 };
@@ -93,23 +94,37 @@ const CLICK_HOLD: Duration = Duration::from_millis(10);
 
 /// Clicks land within this distance of the target (screen px per axis).
 const CONVERGE_TOLERANCE_PX: i32 = 1;
-/// Probe + corrections allowed per closed-loop move (plan §11.3: 2-3
-/// typical; the last slot is the final read-and-decide).
-const CONVERGE_MAX_NUDGES: u32 = 4;
-/// Whole-move budget between nudges: a move that keeps needing more
-/// corrections than the nudge budget, or that stalls past this deadline
-/// between two of them, is skipped rather than clicked wild. (A single
-/// large nudge can legitimately outlive this - its ack covers the device's
-/// paced chunk stream.)
-const CONVERGE_DEADLINE: Duration = Duration::from_millis(150);
+/// Probe + corrections allowed per closed-loop move. The probe is the
+/// whole-distance fast path; under ballistics the walk-back costs a
+/// handful of adapted corrections, each a few milliseconds round-trip. A
+/// broken move is caught by `Pinned` (probe ignored), the deadline and
+/// the caller's click refusal - not by starving this budget.
+const CONVERGE_MAX_NUDGES: u32 = 16;
+/// Whole-move budget. Chunked streams legitimately need tens of ms per
+/// nudge (the device paces the <=127-count reports 4 ms apart and the ack
+/// waits for the last one), so the original 150 ms flat cap stalled
+/// distant moves right after the probe. A pathological loop still ends
+/// here, and any non-convergence refuses the click.
+const CONVERGE_DEADLINE: Duration = Duration::from_millis(2000);
 /// Ballistics gain estimates are clamped to this band so one nonsense
 /// measurement cannot blow the next correction up; corrections are
-/// additionally capped at twice the remaining error (see `converge`).
+/// additionally capped at twice the remaining error (see `step_axis`).
 const GAIN_MIN: f64 = 1.0 / 64.0;
 const GAIN_MAX: f64 = 64.0;
 
 /// Overshoot allowance on top of the twice-the-error correction cap.
 const CORRECTION_HEADROOM_PX: i32 = 16;
+
+/// How much a per-axis step shrinks when it overshoots the target: the
+/// measured gain mispredicted the next report's ballistics bucket, and
+/// repeated mispredictions must contract instead of ping-ponging.
+const OVERSHOOT_SHRINK: f64 = 0.5;
+/// How much a damped step regrows after landing short again. Bounded at
+/// 1.0 - the scale only ever damps.
+const STEP_REGROW: f64 = 2.0;
+/// Floor for the damped step scale: below this the one-count signum
+/// fixup is the only progress anyway.
+const STEP_SCALE_MIN: f64 = 0.125;
 
 /// Finds the vendor control channel interface among HID devices.
 #[must_use]
@@ -742,6 +757,14 @@ enum Nudged {
 /// after the plain ack timeout.
 const CHUNK_STREAM_MS: u64 = 8;
 
+/// Settle time after a nudge before the cursor is read again. The ack
+/// races the cursor: the vendor channel polls at 1 kHz while the mouse
+/// reports cross a 4 ms-poll endpoint and the HID stack, so an immediate
+/// `GetCursorPos` samples a half-applied move - measured gains swing
+/// wildly (even invert sign), and the loop thrashes (observed live
+/// 2026-10-20). A short drain makes every measurement complete.
+const REPORT_SETTLE: Duration = Duration::from_millis(25);
+
 /// The real cursor: `GetCursorPos` reads, `MoveRel` requests for nudges.
 struct OsRelPointer<'a> {
     client: &'a mut Client,
@@ -760,7 +783,7 @@ impl RelPointer for OsRelPointer<'_> {
         // far targets.
         let chunks = u64::from(dx.unsigned_abs().max(dy.unsigned_abs())).div_ceil(127);
         let deadline = self.timeout + Duration::from_millis(chunks * CHUNK_STREAM_MS);
-        match self.client.request(cmd, deadline) {
+        let reply = match self.client.request(cmd, deadline) {
             Ok(wire::Reply::Ok) => Ok(Nudged::Moved),
             Ok(wire::Reply::Echo) => Ok(Nudged::Echoed),
             Ok(wire::Reply::Err(code)) => Err(MoveError::Refused(code)),
@@ -772,7 +795,13 @@ impl RelPointer for OsRelPointer<'_> {
             }
             Err(RequestError::Lost) => Err(MoveError::Lost),
             Err(RequestError::Link(e)) => Err(MoveError::Transport(e)),
+        };
+        // The cursor is only trustworthy after the report queue drains
+        // (see `REPORT_SETTLE`): the ack is not the cursor.
+        if reply.is_ok() {
+            thread::sleep(REPORT_SETTLE);
         }
+        reply
     }
 }
 
@@ -787,22 +816,30 @@ fn scale_axis(err: i32, gain: f64) -> i16 {
     }
 }
 
-/// Adaptive-gain P controller (plan §11.3): probe with the full remaining
-/// error, measure the ballistics gain the OS just applied (`moved / sent`),
-/// then scale every correction by it. Not PID - the cursor is a pure
-/// integrator of deltas, the only nonlinearity is that static gain, and
-/// measuring it per move beats modeling Microsoft's curve. Converges in 2-3
-/// nudges for sane settings; anything else refuses to click rather than
-/// clicking at an unverified position. Returns the landing position and
-/// the nudge count.
+/// Adaptive-gain closed loop (plan §11.3), hardened against real Windows
+/// ballistics after the first off-primary soak (2026-10-20): the probe
+/// carries the full remaining error under a 1:1 assumption (machines with
+/// ballistics disabled still land in one nudge), then every step
+/// re-measures the gain **per axis** and adapts a per-axis step scale that
+/// halves on overshoot - the measured gain mispredicting the next report's
+/// curve bucket is what made the old single-gain loop ping-pong - and
+/// regrows when a step lands short again. Corrections stay capped at twice
+/// the remaining error. Failure is honest: past the nudge budget or the
+/// deadline the move is abandoned with the measured miss, and the caller
+/// refuses to click at an unverified position. Returns the landing
+/// position and the nudge count.
 fn converge(
     pointer: &mut impl RelPointer,
     target: (i32, i32),
     deadline: Duration,
 ) -> Result<((i32, i32), u32), MoveError> {
     let started = Instant::now();
-    // The first probe assumes 1:1; the first measurement replaces it.
-    let mut gain = 1.0_f64;
+    // The probe assumes 1:1; the per-axis measurements replace it.
+    let mut gain = (1.0_f64, 1.0_f64);
+    // Steps shrink when they overshoot the target (a gain misprediction)
+    // and regrow when they land short - the contraction that walks out of
+    // ballistics bucket boundaries instead of ping-ponging between them.
+    let mut step_scale = (1.0_f64, 1.0_f64);
     let mut pos = pointer.read();
     let mut nudges = 0_u32;
     loop {
@@ -815,11 +852,11 @@ fn converge(
         }
         let probe = nudges == 0;
         // The probe carries the full remaining error; corrections are
-        // scaled by the gain measured so far.
+        // scaled by their own axis' gain and damped step scale.
         let mut delta = if probe {
             (scale_axis(err.0, 1.0), scale_axis(err.1, 1.0))
         } else {
-            (scale_axis(err.0, gain), scale_axis(err.1, gain))
+            (step_axis(err.0, gain.0, step_scale.0), step_axis(err.1, gain.1, step_scale.1))
         };
         // A correction that rounds to zero cannot move the cursor: nudge
         // axes outside tolerance by one count so the loop makes progress
@@ -830,19 +867,6 @@ fn converge(
         if delta.1 == 0 && err.1.abs() > CONVERGE_TOLERANCE_PX {
             delta.1 = i16::try_from(err.1.signum()).unwrap_or(0);
         }
-        // A correction scales up when the measured gain is below 1, but a
-        // bogus near-zero measurement (edge clamp, interference) must not
-        // fling the pointer across the desktop: never send more than twice
-        // the remaining error per axis, plus fixed overshoot headroom.
-        let cap = |err_v: i32| -> i16 {
-            let c = (2 * err_v.abs() + CORRECTION_HEADROOM_PX).min(i32::from(i16::MAX));
-            #[allow(clippy::cast_possible_truncation)] // bounded above
-            {
-                c as i16
-            }
-        };
-        delta.0 = delta.0.clamp(-cap(err.0), cap(err.0));
-        delta.1 = delta.1.clamp(-cap(err.1), cap(err.1));
         let before = pos;
         if matches!(pointer.nudge(delta.0, delta.1)?, Nudged::Echoed) {
             // Dry-run never moves the cursor: bail out with the honest
@@ -850,17 +874,21 @@ fn converge(
             return Err(MoveError::DryRun);
         }
         pos = pointer.read();
+        let moved = (pos.0 - before.0, pos.1 - before.1);
         nudges += 1;
-        // Re-measure the gain on the dominant sent axis: ballistics gain is
-        // a function of speed, so each magnitude measures its own factor.
-        let (sent, moved) = if delta.0.abs() >= delta.1.abs() {
-            (i32::from(delta.0), pos.0 - before.0)
-        } else {
-            (i32::from(delta.1), pos.1 - before.1)
-        };
-        // `sent` is always nonzero here: every axis outside tolerance sends
-        // at least its signum after the zero-rounding fixup above.
-        if moved == 0 {
+        debug!(
+            nudge = nudges,
+            sent_x = delta.0,
+            sent_y = delta.1,
+            moved_x = moved.0,
+            moved_y = moved.1,
+            err_x = err.0,
+            err_y = err.1,
+            gain_x = gain.0,
+            gain_y = gain.1,
+            "converge step"
+        );
+        if moved.0 == 0 && moved.1 == 0 {
             if probe {
                 // The cursor ignored a full-size delta: pinned or blocked.
                 return Err(MoveError::Pinned);
@@ -869,12 +897,60 @@ fn converge(
             // the budget lasts.
             continue;
         }
-        let measured = f64::from(moved) / f64::from(sent);
-        if measured > 0.0 {
-            // Negative movement is interference, not ballistics: keep the
-            // previous estimate instead of inverting the next correction.
-            gain = measured.clamp(GAIN_MIN, GAIN_MAX);
+        adapt_axis(delta.0, moved.0, err.0, &mut gain.0, &mut step_scale.0, probe);
+        adapt_axis(delta.1, moved.1, err.1, &mut gain.1, &mut step_scale.1, probe);
+    }
+}
+
+/// Sizes one correction axis: the remaining error scaled by that axis'
+/// measured gain and damped step scale, then bounded - never more than
+/// twice the remaining error (plus fixed headroom) even when a bogus
+/// near-zero gain measurement asks for an i16-span fling.
+fn step_axis(err: i32, gain: f64, scale: f64) -> i16 {
+    let want = f64::from(err) / gain * scale;
+    let cap = f64::from((2 * err.abs() + CORRECTION_HEADROOM_PX).min(i32::from(i16::MAX)));
+    let clamped = want.clamp(-cap, cap);
+    #[allow(clippy::cast_possible_truncation)] // clamped into i16 above
+    {
+        clamped.round() as i16
+    }
+}
+
+/// One axis' post-nudge bookkeeping: re-measure the ballistics gain from
+/// what the axis just did, and - for gain-scaled corrections only - shrink
+/// or regrow the step scale when the step crossed to the other side of the
+/// target or landed short again. The probe's overshoot is ballistics
+/// working as measured, not a misprediction, so it never damps.
+/// Interference (movement against the command) leaves the gain alone -
+/// the flip it causes still damps the next step.
+fn adapt_axis(
+    sent: i16,
+    moved: i32,
+    err_before: i32,
+    gain: &mut f64,
+    scale: &mut f64,
+    probe: bool,
+) {
+    if sent != 0 {
+        let sent = f64::from(i32::from(sent));
+        let moved = f64::from(moved);
+        if moved != 0.0 && moved.signum() == sent.signum() {
+            *gain = (moved / sent).clamp(GAIN_MIN, GAIN_MAX);
         }
+    }
+    if probe {
+        return;
+    }
+    let err_after = err_before - moved;
+    if err_before != 0
+        && err_after.abs() > CONVERGE_TOLERANCE_PX
+        && err_after.signum() != err_before.signum()
+    {
+        // The axis crossed to the wrong side by more than the click
+        // tolerance: the next report's gain exceeded the prediction.
+        *scale = (*scale * OVERSHOOT_SHRINK).max(STEP_SCALE_MIN);
+    } else if *scale < 1.0 {
+        *scale = 1.0_f64.min(*scale * STEP_REGROW);
     }
 }
 
@@ -1199,6 +1275,7 @@ mod tests {
         point_in_primary,
         relative_requested,
         scale_axis,
+        step_axis,
         to_abs,
         wait_ack,
         wants_relative,
@@ -1209,6 +1286,10 @@ mod tests {
         RelPointer,
         ABS_MAX,
         CONVERGE_DEADLINE,
+        CONVERGE_MAX_NUDGES,
+        CORRECTION_HEADROOM_PX,
+        GAIN_MIN,
+        STEP_SCALE_MIN,
     };
     use crate::{
         adapters::kbm::vkbm::{
@@ -1653,11 +1734,11 @@ mod tests {
     }
 
     #[test]
-    fn converges_at_half_gain_with_one_correction() -> Result<(), MoveError> {
+    fn converges_at_half_gain() -> Result<(), MoveError> {
         let mut p = FakePointer::at((0, 0), half);
         let (pos, nudges) = converge(&mut p, (400, 200), CONVERGE_DEADLINE)?;
         assert_eq!(pos, (400, 200));
-        assert_eq!(nudges, 2, "probe + gain-scaled correction");
+        assert!(nudges <= CONVERGE_MAX_NUDGES, "probe + capped corrections: got {nudges}");
         Ok(())
     }
 
@@ -1678,7 +1759,54 @@ mod tests {
             (pos.0 - 1000).abs() <= 1 && (pos.1 - 400).abs() <= 1,
             "lands within the click tolerance, got {pos:?}"
         );
-        assert!(nudges <= 4);
+        assert!(nudges <= CONVERGE_MAX_NUDGES);
+        Ok(())
+    }
+
+    /// The device chunks any command into <=127-count reports, so the OS
+    /// ballistics bucket every large command identically; only single small
+    /// reports sit in lower buckets. Modeled as the gain of the clamped
+    /// command size.
+    fn chunk_bucketed(speed: i32) -> f64 {
+        epp_like(speed.clamp(-127, 127))
+    }
+
+    #[test]
+    fn converges_from_afar_through_chunked_ballistics() -> Result<(), MoveError> {
+        // The live off-primary failure (2026-10-20): a distant probe
+        // overshot under ballistics and the old 4-nudge / 150 ms budget
+        // stalled mid walk-back, leaving the cursor ~190 px off the target.
+        // The full-distance probe plus per-axis adapted corrections must
+        // still land from a desktop away.
+        let mut p = FakePointer::at((-4000, -2000), chunk_bucketed);
+        let (pos, nudges) = converge(&mut p, (330, 450), CONVERGE_DEADLINE)?;
+        assert!(
+            (pos.0 - 330).abs() <= 1 && (pos.1 - 450).abs() <= 1,
+            "got {pos:?} after {nudges} nudges"
+        );
+        assert!(nudges <= CONVERGE_MAX_NUDGES);
+        Ok(())
+    }
+
+    /// A narrow amplified band the corrections must cross: the step sized
+    /// by one bucket's gain lands in the other, the classic shape that made
+    /// the old single-gain loop ping-pong past the target.
+    fn bouncing_bucket(speed: i32) -> f64 {
+        match speed.abs() {
+            5..=60 => 3.0,
+            _ => 1.5,
+        }
+    }
+
+    #[test]
+    fn overshooting_bucket_boundary_damps_then_lands() -> Result<(), MoveError> {
+        let mut p = FakePointer::at((0, 0), bouncing_bucket);
+        let (pos, nudges) = converge(&mut p, (100, 0), CONVERGE_DEADLINE)?;
+        assert!((pos.0 - 100).abs() <= 1, "got {pos:?} after {nudges} nudges");
+        assert!(
+            p.nudges.iter().any(|&(dx, _)| i32::from(dx).abs() < 50),
+            "the damped follow-up step must shrink, not re-fling"
+        );
         Ok(())
     }
 
@@ -1719,21 +1847,21 @@ mod tests {
 
     #[test]
     fn bogus_low_gain_is_capped_not_flinging() {
-        // A near-zero gain measurement (edge clamp, interference) would
-        // scale the next correction to the i16 clamp; the cap must bound it
-        // to twice the remaining error instead of a desktop-span fling.
-        let mut p = FakePointer::at((0, 0), |s| f64::from(s) / 100.0);
-        let target = 3_000;
-        let outcome = converge(&mut p, (target, 0), CONVERGE_DEADLINE);
-        assert!(matches!(outcome, Err(MoveError::Stalled { .. })), "got {outcome:?}");
-        let mut last_err = target;
-        for (dx, _) in p.nudges.iter().skip(1) {
-            assert!(
-                i32::from(*dx) <= 2 * last_err + 16,
-                "correction {dx} flings past the remaining error {last_err}"
-            );
-            last_err -= i32::from(*dx) / 100;
+        // A near-zero gain measurement (edge clamp, interference) would ask
+        // for an i16-span correction; the step bound must keep every axis
+        // within twice the remaining error plus the fixed headroom, damped
+        // or not, and stay inside the wire range.
+        for err in [1, 7, 100, 5_000, 100_000, i32::MAX / 4] {
+            for scale in [1.0, 0.5, STEP_SCALE_MIN] {
+                let step = i32::from(step_axis(err, GAIN_MIN, scale));
+                let bound = (2 * err.abs() + CORRECTION_HEADROOM_PX).min(i32::from(i16::MAX));
+                assert!(
+                    step.abs() <= bound,
+                    "err {err} scale {scale}: step {step} flings past {bound}"
+                );
+            }
         }
+        assert_eq!(step_axis(0, 1.0, 1.0), 0, "no error, no step");
     }
 
     #[test]
