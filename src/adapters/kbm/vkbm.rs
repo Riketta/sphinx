@@ -93,7 +93,10 @@ const ABS_MAX: u16 = 32_767;
 const CLICK_HOLD: Duration = Duration::from_millis(10);
 
 /// Clicks land within this distance of the target (screen px per axis).
-const CONVERGE_TOLERANCE_PX: i32 = 1;
+/// Two, not one: a 1-count report can legally move the cursor 0 px (the
+/// OS rounds), so demanding 1 px bounces the last mile against
+/// quantization - and the button is tens of pixels wide anyway.
+const CONVERGE_TOLERANCE_PX: i32 = 2;
 /// Probe + corrections allowed per closed-loop move. The probe is the
 /// whole-distance fast path; under ballistics the walk-back costs a
 /// handful of adapted corrections, each a few milliseconds round-trip. A
@@ -120,11 +123,28 @@ const CORRECTION_HEADROOM_PX: i32 = 16;
 /// repeated mispredictions must contract instead of ping-ponging.
 const OVERSHOOT_SHRINK: f64 = 0.5;
 /// How much a damped step regrows after landing short again. Bounded at
-/// 1.0 - the scale only ever damps.
-const STEP_REGROW: f64 = 2.0;
+/// 1.0 and slower than the shrink - re-entering an overshoot costs a
+/// flip, landing short again costs nothing.
+const STEP_REGROW: f64 = 1.5;
 /// Floor for the damped step scale: below this the one-count signum
 /// fixup is the only progress anyway.
 const STEP_SCALE_MIN: f64 = 0.125;
+
+/// Deliberate under-correction of every gain-scaled step: a mispredicted
+/// ballistics bucket then lands short of the target (one more nudge)
+/// instead of crossing it (a flip that must be damped back). This is
+/// what turns the live-observed back-and-forth bounce into a mostly
+/// monotone approach.
+const CORRECTION_FACTOR: f64 = 0.9;
+
+/// Recent (step size, measured gain) samples kept per axis. The live
+/// traces show the gain is a stable function of report size within a
+/// movement (3 counts ~ 0.5x, 12-27 counts ~ 1.5x), so the gain measured
+/// at the most similar size predicts the next step far better than the
+/// last step's gain does. Recent only: right after an idle the whole
+/// curve sits lower (the OS speed estimate ramps up) - old samples from
+/// a dead regime would mispredict.
+const PROFILE_SAMPLES: usize = 8;
 
 /// Finds the vendor control channel interface among HID devices.
 #[must_use]
@@ -836,6 +856,9 @@ fn converge(
     let started = Instant::now();
     // The probe assumes 1:1; the per-axis measurements replace it.
     let mut gain = (1.0_f64, 1.0_f64);
+    // Recent per-axis (size, gain) samples: the curve the corrections are
+    // sized against (see `PROFILE_SAMPLES`).
+    let mut profile = (Vec::<(i32, f64)>::new(), Vec::<(i32, f64)>::new());
     // Steps shrink when they overshoot the target (a gain misprediction)
     // and regrow when they land short - the contraction that walks out of
     // ballistics bucket boundaries instead of ping-ponging between them.
@@ -856,7 +879,10 @@ fn converge(
         let mut delta = if probe {
             (scale_axis(err.0, 1.0), scale_axis(err.1, 1.0))
         } else {
-            (step_axis(err.0, gain.0, step_scale.0), step_axis(err.1, gain.1, step_scale.1))
+            (
+                step_axis(err.0, &profile.0, gain.0, step_scale.0),
+                step_axis(err.1, &profile.1, gain.1, step_scale.1),
+            )
         };
         // A correction that rounds to zero cannot move the cursor: nudge
         // axes outside tolerance by one count so the loop makes progress
@@ -897,23 +923,42 @@ fn converge(
             // the budget lasts.
             continue;
         }
-        adapt_axis(delta.0, moved.0, err.0, &mut gain.0, &mut step_scale.0, probe);
-        adapt_axis(delta.1, moved.1, err.1, &mut gain.1, &mut step_scale.1, probe);
+        adapt_axis(delta.0, moved.0, err.0, &mut gain.0, &mut step_scale.0, probe, &mut profile.0);
+        adapt_axis(delta.1, moved.1, err.1, &mut gain.1, &mut step_scale.1, probe, &mut profile.1);
     }
 }
 
-/// Sizes one correction axis: the remaining error scaled by that axis'
-/// measured gain and damped step scale, then bounded - never more than
-/// twice the remaining error (plus fixed headroom) even when a bogus
-/// near-zero gain measurement asks for an i16-span fling.
-fn step_axis(err: i32, gain: f64, scale: f64) -> i16 {
-    let want = f64::from(err) / gain * scale;
-    let cap = f64::from((2 * err.abs() + CORRECTION_HEADROOM_PX).min(i32::from(i16::MAX)));
-    let clamped = want.clamp(-cap, cap);
-    #[allow(clippy::cast_possible_truncation)] // clamped into i16 above
-    {
-        clamped.round() as i16
+/// The gain measured at the step size most similar to `size`, or
+/// `fallback` when the profile is empty.
+fn gain_for_size(profile: &[(i32, f64)], size: i32, fallback: f64) -> f64 {
+    let mut best: Option<(i32, f64)> = None;
+    for &(s, g) in profile {
+        let d = (s - size).abs();
+        if best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, g));
+        }
     }
+    best.map_or(fallback, |(_, g)| g)
+}
+
+/// Sizes one correction axis: the remaining error scaled by the gain
+/// measured at the most similar step size, re-read at the proposed size,
+/// under-corrected, bounded - never more than twice the remaining error
+/// (plus fixed headroom) even when the profile asks for an i16-span
+/// fling. The i32→i16 casts are bounded by construction (the cap and the
+/// 1.0 floor), hence the blanket allow.
+#[allow(clippy::cast_possible_truncation)]
+fn step_axis(err: i32, profile: &[(i32, f64)], fallback: f64, scale: f64) -> i16 {
+    let a = err.abs();
+    if a == 0 {
+        return 0;
+    }
+    let mut g = gain_for_size(profile, a, fallback);
+    let k1 = (f64::from(a) / g * CORRECTION_FACTOR * scale).round().max(1.0) as i32;
+    g = gain_for_size(profile, k1, g);
+    let k = (f64::from(a) / g * CORRECTION_FACTOR * scale).round().max(1.0) as i32;
+    let cap = (2 * a + CORRECTION_HEADROOM_PX).min(i32::from(i16::MAX));
+    (err.signum() * k.min(cap)) as i16
 }
 
 /// One axis' post-nudge bookkeeping: re-measure the ballistics gain from
@@ -930,12 +975,21 @@ fn adapt_axis(
     gain: &mut f64,
     scale: &mut f64,
     probe: bool,
+    profile: &mut Vec<(i32, f64)>,
 ) {
     if sent != 0 {
+        let size = i32::from(sent).abs();
         let sent = f64::from(i32::from(sent));
         let moved = f64::from(moved);
         if moved != 0.0 && moved.signum() == sent.signum() {
-            *gain = (moved / sent).clamp(GAIN_MIN, GAIN_MAX);
+            let measured = (moved / sent).clamp(GAIN_MIN, GAIN_MAX);
+            *gain = measured;
+            // Remember what this step size did, for the next sizing (the
+            // oldest sample drops off - only the current regime speaks).
+            if profile.len() == PROFILE_SAMPLES {
+                profile.remove(0);
+            }
+            profile.push((size, measured));
         }
     }
     if probe {
@@ -1287,6 +1341,7 @@ mod tests {
         ABS_MAX,
         CONVERGE_DEADLINE,
         CONVERGE_MAX_NUDGES,
+        CONVERGE_TOLERANCE_PX,
         CORRECTION_HEADROOM_PX,
         GAIN_MIN,
         STEP_SCALE_MIN,
@@ -1709,13 +1764,12 @@ mod tests {
         }
     }
 
-    /// 20x on large sends (the max pointer-speed setting), 1:1 on small.
-    fn twenty_on_large(speed: i32) -> f64 {
-        if speed.abs() > 500 {
-            20.0
-        } else {
-            1.0
-        }
+    /// The pointer-speed slider's max uniform multiplier (~10x). Physical
+    /// note: `MoveRel` reports never exceed 127 counts (the device chunks
+    /// them), so an OS gain can only be a function of report sizes up to
+    /// 127 - a size-dependent cliff beyond that cannot happen on the wire.
+    fn uniform_ten(_: i32) -> f64 {
+        10.0
     }
 
     /// A flat 20x on every send including 1-count corrections: the
@@ -1737,17 +1791,25 @@ mod tests {
     fn converges_at_half_gain() -> Result<(), MoveError> {
         let mut p = FakePointer::at((0, 0), half);
         let (pos, nudges) = converge(&mut p, (400, 200), CONVERGE_DEADLINE)?;
-        assert_eq!(pos, (400, 200));
+        assert!(
+            (pos.0 - 400).abs() <= CONVERGE_TOLERANCE_PX
+                && (pos.1 - 200).abs() <= CONVERGE_TOLERANCE_PX,
+            "got {pos:?} after {nudges} nudges"
+        );
         assert!(nudges <= CONVERGE_MAX_NUDGES, "probe + capped corrections: got {nudges}");
         Ok(())
     }
 
     #[test]
     fn converges_at_max_pointer_speed_gain() -> Result<(), MoveError> {
-        let mut p = FakePointer::at((0, 0), twenty_on_large);
+        let mut p = FakePointer::at((0, 0), uniform_ten);
         let (pos, nudges) = converge(&mut p, (1000, 300), CONVERGE_DEADLINE)?;
-        assert_eq!(pos, (1000, 300));
-        assert!(nudges <= 4, "adaptive gain must not need brute force");
+        assert!(
+            (pos.0 - 1000).abs() <= CONVERGE_TOLERANCE_PX
+                && (pos.1 - 300).abs() <= CONVERGE_TOLERANCE_PX,
+            "got {pos:?} after {nudges} nudges"
+        );
+        assert!(nudges <= 8, "under-correction costs a few nudges, got {nudges}");
         Ok(())
     }
 
@@ -1756,7 +1818,8 @@ mod tests {
         let mut p = FakePointer::at((0, 0), epp_like);
         let (pos, nudges) = converge(&mut p, (1000, 400), CONVERGE_DEADLINE)?;
         assert!(
-            (pos.0 - 1000).abs() <= 1 && (pos.1 - 400).abs() <= 1,
+            (pos.0 - 1000).abs() <= CONVERGE_TOLERANCE_PX
+                && (pos.1 - 400).abs() <= CONVERGE_TOLERANCE_PX,
             "lands within the click tolerance, got {pos:?}"
         );
         assert!(nudges <= CONVERGE_MAX_NUDGES);
@@ -1781,7 +1844,8 @@ mod tests {
         let mut p = FakePointer::at((-4000, -2000), chunk_bucketed);
         let (pos, nudges) = converge(&mut p, (330, 450), CONVERGE_DEADLINE)?;
         assert!(
-            (pos.0 - 330).abs() <= 1 && (pos.1 - 450).abs() <= 1,
+            (pos.0 - 330).abs() <= CONVERGE_TOLERANCE_PX
+                && (pos.1 - 450).abs() <= CONVERGE_TOLERANCE_PX,
             "got {pos:?} after {nudges} nudges"
         );
         assert!(nudges <= CONVERGE_MAX_NUDGES);
@@ -1802,7 +1866,7 @@ mod tests {
     fn overshooting_bucket_boundary_damps_then_lands() -> Result<(), MoveError> {
         let mut p = FakePointer::at((0, 0), bouncing_bucket);
         let (pos, nudges) = converge(&mut p, (100, 0), CONVERGE_DEADLINE)?;
-        assert!((pos.0 - 100).abs() <= 1, "got {pos:?} after {nudges} nudges");
+        assert!((pos.0 - 100).abs() <= CONVERGE_TOLERANCE_PX, "got {pos:?} after {nudges} nudges");
         assert!(
             p.nudges.iter().any(|&(dx, _)| i32::from(dx).abs() < 50),
             "the damped follow-up step must shrink, not re-fling"
@@ -1853,7 +1917,7 @@ mod tests {
         // or not, and stay inside the wire range.
         for err in [1, 7, 100, 5_000, 100_000, i32::MAX / 4] {
             for scale in [1.0, 0.5, STEP_SCALE_MIN] {
-                let step = i32::from(step_axis(err, GAIN_MIN, scale));
+                let step = i32::from(step_axis(err, &[], GAIN_MIN, scale));
                 let bound = (2 * err.abs() + CORRECTION_HEADROOM_PX).min(i32::from(i16::MAX));
                 assert!(
                     step.abs() <= bound,
@@ -1861,7 +1925,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(step_axis(0, 1.0, 1.0), 0, "no error, no step");
+        assert_eq!(step_axis(0, &[], 1.0, 1.0), 0, "no error, no step");
     }
 
     #[test]
