@@ -183,6 +183,28 @@ pub struct SerialBackend {
     pub baud: u32,
 }
 
+/// How the vkbm backend places the pointer before a click (§11.3).
+///
+/// - `relative` (default): closed loop - sphinx reads `GetCursorPos`, sends
+///   true relative deltas through the board's relative-mouse interface,
+///   measures the OS ballistics gain and converges on the target. Reaches
+///   every monitor; needs firmware 0.5+.
+/// - `abs`: one absolute HID report per click. Fast and deterministic, but
+///   Windows normalizes absolute mice to the primary display only.
+/// - `auto`: absolute on the primary monitor, closed-loop relative
+///   elsewhere.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MoveMode {
+    /// Closed-loop relative moves (default; any monitor).
+    #[default]
+    Relative,
+    /// Absolute HID reports (primary monitor only).
+    Abs,
+    /// Absolute on the primary, relative elsewhere.
+    Auto,
+}
+
 /// vkbm-backend settings (§11.4): the versa-kbm RP2040 dongle.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -197,11 +219,19 @@ pub struct VkbmBackend {
     /// dedups by sequence number, so the resend cannot execute twice).
     #[serde(default = "d_vkbm_ack_timeout_ms")]
     pub ack_timeout_ms: u64,
+    /// Pointer placement strategy (see [`MoveMode`]).
+    #[serde(default)]
+    pub move_mode: MoveMode,
 }
 
 impl Default for VkbmBackend {
     fn default() -> Self {
-        Self { vid: d_vkbm_vid(), pid: d_vkbm_pid(), ack_timeout_ms: d_vkbm_ack_timeout_ms() }
+        Self {
+            vid: d_vkbm_vid(),
+            pid: d_vkbm_pid(),
+            ack_timeout_ms: d_vkbm_ack_timeout_ms(),
+            move_mode: MoveMode::default(),
+        }
     }
 }
 
@@ -435,8 +465,9 @@ impl Config {
                         .as_ref()
                         .map(|v| {
                             format!(
-                                " (vid {:#06x}, pid {:#06x}, ack_timeout_ms {} configured)",
-                                v.vid, v.pid, v.ack_timeout_ms
+                                " (vid {:#06x}, pid {:#06x}, ack_timeout_ms {}, move_mode {:?} \
+                                 configured)",
+                                v.vid, v.pid, v.ack_timeout_ms, v.move_mode
                             )
                         })
                         .unwrap_or_default();
@@ -633,6 +664,30 @@ mod tests {
             cfg.backend.vkbm = Some(VkbmBackend::default());
         })
         .is_ok());
+    }
+
+    #[cfg(feature = "vkbm")]
+    #[test]
+    fn vkbm_move_mode_parses_and_defaults_to_relative() -> Result<(), String> {
+        // An empty table latches the defaults; the omitted key inside it is
+        // the closed-loop relative mode.
+        let cfg = parse(&format!("{VALID}[backend]\nkind = \"vkbm\"\n[backend.vkbm]\n"))?
+            .backend
+            .vkbm
+            .ok_or("empty table latches defaults")?;
+        assert_eq!(cfg.move_mode, super::MoveMode::Relative);
+        let cfg = parse(&format!(
+            "{VALID}[backend]\nkind = \"vkbm\"\n[backend.vkbm]\nmove_mode = \"auto\"\n"
+        ))?
+        .backend
+        .vkbm
+        .ok_or("table latched")?;
+        assert_eq!(cfg.move_mode, super::MoveMode::Auto);
+        assert!(parse(&format!(
+            "{VALID}[backend]\nkind = \"vkbm\"\n[backend.vkbm]\nmove_mode = \"sideways\"\n"
+        ))
+        .is_err());
+        Ok(())
     }
 
     #[cfg(not(feature = "vkbm"))]

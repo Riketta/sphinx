@@ -48,3 +48,8 @@ kind = "sendinput"
 # vid = 0x258a           # USB vendor id to scan for (firmware default)
 # pid = 0x0100           # USB product id to scan for (firmware default)
 # ack_timeout_ms = 250   # per-attempt ack deadline; a lost ack is resent once
+# move_mode = "relative" # pointer placement (default): closed loop over true
+#                        # relative reports, works on every monitor; needs
+#                        # firmware 0.5+. "abs" = one absolute HID report
+#                        # (primary monitor only); "auto" = abs on the
+#                        # primary, closed loop elsewhere.

@@ -8,22 +8,23 @@
 //! one ack per command, one resend on a lost ack. The resend is safe even
 //! for actuation because the device dedups by sequence number within a
 //! short window - a resent frame is answered from cache, not executed
-//! twice. The codec below mirrors `vkbm-proto` v0.4 (the shared `no_std`
-//! crate in the versa-kbm repo); the startup handshake pins the protocol
-//! major version so firmware/codec drift fails loudly instead of clicking
-//! wrong.
+//! twice. The codec below mirrors `vkbm-proto` (the shared `no_std` crate
+//! in the versa-kbm repo; byte-stable since v0.3); the startup handshake
+//! pins the protocol major so firmware/codec drift fails loudly instead of
+//! clicking wrong.
 //!
 //! Coordinates are screen pixels translated by the shared [`ActuationGuard`]
-//! like every other backend; the screen point is then mapped endpoint-exact
-//! onto the HID absolute range (`0..=32767`), which the OS scales across
-//! the primary monitor. That mapping is a hardware property - Windows
-//! normalizes absolute HID mice to the primary display, so the backend
-//! refuses targets outside it instead of letting the clamp land the click
-//! somewhere random on the primary (multi-monitor needs the planned
-//! closed-loop relative mode).
+//! like every other backend. Where the pointer goes from there is a
+//! `move_mode` choice ([`MoveMode`]): `relative` (the default) converges on
+//! the target with a closed loop over true relative reports - probe, measure
+//! the OS ballistics gain, correct - which reaches every monitor; `abs`
+//! sends one absolute HID report (`0..=32767`), which Windows normalizes
+//! across the primary display only; `auto` picks abs on the primary and the
+//! closed loop elsewhere.
 
 use std::{
     fmt,
+    thread,
     time::{
         Duration,
         Instant,
@@ -57,6 +58,7 @@ use crate::{
         },
         kbm::guard::ActuationGuard,
     },
+    config::MoveMode,
     ports::{
         kbm::Key,
         Kbm,
@@ -75,8 +77,39 @@ const USAGE_ESCAPE: u8 = 0x29;
 /// Protocol major this backend speaks; `new` refuses anything else.
 const PROTOCOL_MAJOR: u8 = 0;
 
+/// Firmware minor that introduced the true relative pointer (fw 0.5).
+/// Before it, `MoveRel` re-emitted an absolute report at the device's
+/// tracked anchor - position-unknown under ballistics and user interference,
+/// so a closed loop cannot trust it. Modes that move relatively require at
+/// least this minor at init.
+const RELATIVE_FW_MINOR: u8 = 5;
+
 /// Highest coordinate of the HID absolute-mouse mapping (logical maximum).
 const ABS_MAX: u16 = 32_767;
+
+/// How long the held button stays down in a relative-mode click, matching
+/// the device's default tap hold.
+const CLICK_HOLD: Duration = Duration::from_millis(10);
+
+/// Clicks land within this distance of the target (screen px per axis).
+const CONVERGE_TOLERANCE_PX: i32 = 1;
+/// Probe + corrections allowed per closed-loop move (plan §11.3: 2-3
+/// typical; the last slot is the final read-and-decide).
+const CONVERGE_MAX_NUDGES: u32 = 4;
+/// Whole-move budget between nudges: a move that keeps needing more
+/// corrections than the nudge budget, or that stalls past this deadline
+/// between two of them, is skipped rather than clicked wild. (A single
+/// large nudge can legitimately outlive this - its ack covers the device's
+/// paced chunk stream.)
+const CONVERGE_DEADLINE: Duration = Duration::from_millis(150);
+/// Ballistics gain estimates are clamped to this band so one nonsense
+/// measurement cannot blow the next correction up; corrections are
+/// additionally capped at twice the remaining error (see `converge`).
+const GAIN_MIN: f64 = 1.0 / 64.0;
+const GAIN_MAX: f64 = 64.0;
+
+/// Overshoot allowance on top of the twice-the-error correction cap.
+const CORRECTION_HEADROOM_PX: i32 = 16;
 
 /// Finds the vendor control channel interface among HID devices.
 #[must_use]
@@ -91,9 +124,9 @@ fn find_device(api: &HidApi, vid: u16, pid: u16) -> Option<hidapi::DeviceInfo> {
         .cloned()
 }
 
-/// Wire codec mirroring `vkbm-proto` v0.4: the command subset sphinx sends,
-/// the full reply vocabulary, and the 64-byte framing. Keep in sync with
-/// the shared crate; the protocol-major handshake at init catches drift.
+/// Wire codec mirroring `vkbm-proto`: the command subset sphinx sends, the
+/// full reply vocabulary, and the 64-byte framing. Keep in sync with the
+/// shared crate; the protocol-major handshake at init catches drift.
 mod wire {
     use core::fmt;
 
@@ -106,7 +139,11 @@ mod wire {
     const TAG_INFO: u8 = 0x02;
     const TAG_KEY_TAP: u8 = 0x12;
     const TAG_MOVE_ABS: u8 = 0x20;
+    const TAG_MOVE_REL: u8 = 0x21;
+    const TAG_MOUSE_DOWN: u8 = 0x22;
+    const TAG_MOUSE_UP: u8 = 0x23;
     const TAG_CLICK_ABS: u8 = 0x24;
+    const TAG_RELEASE_ALL: u8 = 0x30;
     const TAG_DRY_RUN: u8 = 0x34;
 
     // Reply tags (device -> host).
@@ -122,6 +159,9 @@ mod wire {
     const TAG_ERR_NOT_IMPLEMENTED: u8 = 0x04;
     const TAG_ERR_KEYBOARD_FULL: u8 = 0x05;
     const TAG_ERR_DISABLED: u8 = 0x06;
+
+    /// Wire tag of the primary (left) mouse button.
+    pub(super) const BUTTON_LEFT: u8 = 1;
 
     /// Bits of the [`Reply::Info`] `flags` byte (device gate states).
     /// `pub` is contained by the private `mod wire`.
@@ -155,6 +195,19 @@ mod wire {
             /// Absolute Y, `0..=32767`.
             y: u16,
         },
+        /// Moves the pointer by a signed delta (a true relative report; the
+        /// OS applies its pointer ballistics to it).
+        MoveRel {
+            /// Signed X delta.
+            dx: i16,
+            /// Signed Y delta.
+            dy: i16,
+        },
+        /// Presses the primary (left) button down. The device routes button
+        /// reports to the pointer interface that moved last.
+        MouseDown,
+        /// Releases the primary button.
+        MouseUp,
         /// Moves to an absolute position, then clicks the primary button.
         ClickAbs {
             /// Absolute X, `0..=32767`.
@@ -162,6 +215,9 @@ mod wire {
             /// Absolute Y, `0..=32767`.
             y: u16,
         },
+        /// Releases every held key and button (release-class on the device:
+        /// it bypasses the gates and dedup-replays like any other command).
+        ReleaseAll,
         /// Toggles device dry-run (echoes instead of actuating).
         DryRun {
             /// `true` turns dry-run on.
@@ -176,7 +232,11 @@ mod wire {
                 Self::Info => f.write_str("info"),
                 Self::KeyTap { usage } => write!(f, "key-tap usage={usage}"),
                 Self::MoveAbs { x, y } => write!(f, "move-abs x={x} y={y}"),
+                Self::MoveRel { dx, dy } => write!(f, "move-rel dx={dx} dy={dy}"),
+                Self::MouseDown => f.write_str("mouse-down button=left"),
+                Self::MouseUp => f.write_str("mouse-up button=left"),
                 Self::ClickAbs { x, y } => write!(f, "click-abs x={x} y={y}"),
+                Self::ReleaseAll => f.write_str("release-all"),
                 Self::DryRun { enabled } => write!(f, "dry-run enabled={enabled}"),
             }
         }
@@ -264,11 +324,25 @@ mod wire {
                 put_le16(out, 2, x);
                 put_le16(out, 4, y);
             }
+            Cmd::MoveRel { dx, dy } => {
+                put_byte(out, 1, TAG_MOVE_REL);
+                put_le16(out, 2, u16::from_le_bytes(dx.to_le_bytes()));
+                put_le16(out, 4, u16::from_le_bytes(dy.to_le_bytes()));
+            }
+            Cmd::MouseDown => {
+                put_byte(out, 1, TAG_MOUSE_DOWN);
+                put_byte(out, 2, BUTTON_LEFT);
+            }
+            Cmd::MouseUp => {
+                put_byte(out, 1, TAG_MOUSE_UP);
+                put_byte(out, 2, BUTTON_LEFT);
+            }
             Cmd::ClickAbs { x, y } => {
                 put_byte(out, 1, TAG_CLICK_ABS);
                 put_le16(out, 2, x);
                 put_le16(out, 4, y);
             }
+            Cmd::ReleaseAll => put_byte(out, 1, TAG_RELEASE_ALL),
             Cmd::DryRun { enabled } => {
                 put_byte(out, 1, TAG_DRY_RUN);
                 put_byte(out, 2, u8::from(enabled));
@@ -589,11 +663,228 @@ fn report_actuation(action: &str, cmd: wire::Cmd, outcome: Result<wire::Reply, R
     }
 }
 
+/// Whether a movement mode needs the firmware's true relative pointer at
+/// all (fw 0.5+).
+fn relative_requested(mode: MoveMode) -> bool {
+    matches!(mode, MoveMode::Relative | MoveMode::Auto)
+}
+
+/// Whether this move should take the closed-loop path: `Relative` always,
+/// `Abs` never, `Auto` everywhere but the primary monitor.
+fn wants_relative(mode: MoveMode, point: (i32, i32), primary: (i32, i32)) -> bool {
+    match mode {
+        MoveMode::Abs => false,
+        MoveMode::Relative => true,
+        MoveMode::Auto => !point_in_primary(point, primary),
+    }
+}
+
+/// Why a closed-loop move gave up. None of these click; the addon's stage
+/// timeouts surface the gap.
+#[derive(Debug)]
+enum MoveError {
+    /// The device did not ack the move (send + one resend): the cursor may
+    /// or may not have gone where the delta asked.
+    Lost,
+    /// The transport broke; retrying cannot help.
+    Transport(LinkError),
+    /// The device refused the move (a gate is closed).
+    Refused(wire::ErrorCode),
+    /// The probe moved the cursor not at all: pinned at a desktop edge or
+    /// swallowed by interference.
+    Pinned,
+    /// The nudge budget or time ran out with the cursor outside tolerance.
+    Stalled { err: (i32, i32) },
+    /// The device is in dry-run: every nudge echoes without moving, so a
+    /// closed loop can never converge. Diagnose this instead of reporting a
+    /// bogus "pinned cursor".
+    DryRun,
+}
+
+impl fmt::Display for MoveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lost => f.write_str("ack lost (send + one resend)"),
+            Self::Transport(e) => write!(f, "transport failed: {e}"),
+            Self::Refused(code) => write!(f, "device refused: {code}"),
+            Self::Pinned => f.write_str("cursor did not move (pinned or swallowed)"),
+            Self::Stalled { err } => {
+                write!(f, "stalled {} px short of the target", err.0.abs().max(err.1.abs()))
+            }
+            Self::DryRun => f.write_str("device dry-run is on (echoed, nothing actuated)"),
+        }
+    }
+}
+
+/// The visible cursor through the device's relative pointer: read where it
+/// is, nudge it by one raw delta (the OS applies ballistics on the way).
+trait RelPointer {
+    /// Current position in screen coordinates.
+    fn read(&self) -> (i32, i32);
+
+    /// Sends one relative delta; `Ok` when the device acked execution.
+    fn nudge(&mut self, dx: i16, dy: i16) -> Result<Nudged, MoveError>;
+}
+
+/// Whether one nudge physically moved the pointer or was only echoed (the
+/// device is in dry-run - the command path ran, nothing moved).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Nudged {
+    /// Executed.
+    Moved,
+    /// Echoed by dry-run.
+    Echoed,
+}
+
+/// Per-chunk stream allowance for nudge deadlines: the device paces the
+/// <=127-count reports at `inter_ms` (4 ms default) and each waits up to
+/// one endpoint poll interval (4 ms), so a large delta's ack lands well
+/// after the plain ack timeout.
+const CHUNK_STREAM_MS: u64 = 8;
+
+/// The real cursor: `GetCursorPos` reads, `MoveRel` requests for nudges.
+struct OsRelPointer<'a> {
+    client: &'a mut Client,
+    timeout: Duration,
+}
+
+impl RelPointer for OsRelPointer<'_> {
+    fn read(&self) -> (i32, i32) {
+        read_cursor()
+    }
+
+    fn nudge(&mut self, dx: i16, dy: i16) -> Result<Nudged, MoveError> {
+        let cmd = wire::Cmd::MoveRel { dx, dy };
+        // The ack lands only after the paced chunk stream finishes: grow
+        // the deadline with the requested delta instead of losing acks for
+        // far targets.
+        let chunks = u64::from(dx.unsigned_abs().max(dy.unsigned_abs())).div_ceil(127);
+        let deadline = self.timeout + Duration::from_millis(chunks * CHUNK_STREAM_MS);
+        match self.client.request(cmd, deadline) {
+            Ok(wire::Reply::Ok) => Ok(Nudged::Moved),
+            Ok(wire::Reply::Echo) => Ok(Nudged::Echoed),
+            Ok(wire::Reply::Err(code)) => Err(MoveError::Refused(code)),
+            // A protocol-nonsense reply still proves the device processed
+            // the frame; treat the move as executed rather than looping.
+            Ok(other) => {
+                warn!(command = %cmd, "vkbm unexpected reply {other:?}");
+                Ok(Nudged::Moved)
+            }
+            Err(RequestError::Lost) => Err(MoveError::Lost),
+            Err(RequestError::Link(e)) => Err(MoveError::Transport(e)),
+        }
+    }
+}
+
+/// Scales an error by a gain (1.0 = the raw probe), rounded into the wire's
+/// i16 delta range.
+fn scale_axis(err: i32, gain: f64) -> i16 {
+    let scaled = (f64::from(err) / gain).round();
+    let clamped = scaled.clamp(f64::from(i16::MIN), f64::from(i16::MAX));
+    #[allow(clippy::cast_possible_truncation)] // clamped into i16 above
+    {
+        clamped as i16
+    }
+}
+
+/// Adaptive-gain P controller (plan §11.3): probe with the full remaining
+/// error, measure the ballistics gain the OS just applied (`moved / sent`),
+/// then scale every correction by it. Not PID - the cursor is a pure
+/// integrator of deltas, the only nonlinearity is that static gain, and
+/// measuring it per move beats modeling Microsoft's curve. Converges in 2-3
+/// nudges for sane settings; anything else refuses to click rather than
+/// clicking at an unverified position. Returns the landing position and
+/// the nudge count.
+fn converge(
+    pointer: &mut impl RelPointer,
+    target: (i32, i32),
+    deadline: Duration,
+) -> Result<((i32, i32), u32), MoveError> {
+    let started = Instant::now();
+    // The first probe assumes 1:1; the first measurement replaces it.
+    let mut gain = 1.0_f64;
+    let mut pos = pointer.read();
+    let mut nudges = 0_u32;
+    loop {
+        let err = (target.0 - pos.0, target.1 - pos.1);
+        if err.0.abs() <= CONVERGE_TOLERANCE_PX && err.1.abs() <= CONVERGE_TOLERANCE_PX {
+            return Ok((pos, nudges));
+        }
+        if nudges >= CONVERGE_MAX_NUDGES || started.elapsed() >= deadline {
+            return Err(MoveError::Stalled { err });
+        }
+        let probe = nudges == 0;
+        // The probe carries the full remaining error; corrections are
+        // scaled by the gain measured so far.
+        let mut delta = if probe {
+            (scale_axis(err.0, 1.0), scale_axis(err.1, 1.0))
+        } else {
+            (scale_axis(err.0, gain), scale_axis(err.1, gain))
+        };
+        // A correction that rounds to zero cannot move the cursor: nudge
+        // axes outside tolerance by one count so the loop makes progress
+        // (and the next measurement has something to read).
+        if delta.0 == 0 && err.0.abs() > CONVERGE_TOLERANCE_PX {
+            delta.0 = i16::try_from(err.0.signum()).unwrap_or(0);
+        }
+        if delta.1 == 0 && err.1.abs() > CONVERGE_TOLERANCE_PX {
+            delta.1 = i16::try_from(err.1.signum()).unwrap_or(0);
+        }
+        // A correction scales up when the measured gain is below 1, but a
+        // bogus near-zero measurement (edge clamp, interference) must not
+        // fling the pointer across the desktop: never send more than twice
+        // the remaining error per axis, plus fixed overshoot headroom.
+        let cap = |err_v: i32| -> i16 {
+            let c = (2 * err_v.abs() + CORRECTION_HEADROOM_PX).min(i32::from(i16::MAX));
+            #[allow(clippy::cast_possible_truncation)] // bounded above
+            {
+                c as i16
+            }
+        };
+        delta.0 = delta.0.clamp(-cap(err.0), cap(err.0));
+        delta.1 = delta.1.clamp(-cap(err.1), cap(err.1));
+        let before = pos;
+        if matches!(pointer.nudge(delta.0, delta.1)?, Nudged::Echoed) {
+            // Dry-run never moves the cursor: bail out with the honest
+            // diagnosis instead of measuring a bogus zero gain.
+            return Err(MoveError::DryRun);
+        }
+        pos = pointer.read();
+        nudges += 1;
+        // Re-measure the gain on the dominant sent axis: ballistics gain is
+        // a function of speed, so each magnitude measures its own factor.
+        let (sent, moved) = if delta.0.abs() >= delta.1.abs() {
+            (i32::from(delta.0), pos.0 - before.0)
+        } else {
+            (i32::from(delta.1), pos.1 - before.1)
+        };
+        // `sent` is always nonzero here: every axis outside tolerance sends
+        // at least its signum after the zero-rounding fixup above.
+        if moved == 0 {
+            if probe {
+                // The cursor ignored a full-size delta: pinned or blocked.
+                return Err(MoveError::Pinned);
+            }
+            // A sub-count correction can legally round to zero; retry while
+            // the budget lasts.
+            continue;
+        }
+        let measured = f64::from(moved) / f64::from(sent);
+        if measured > 0.0 {
+            // Negative movement is interference, not ballistics: keep the
+            // previous estimate instead of inverting the next correction.
+            gain = measured.clamp(GAIN_MIN, GAIN_MAX);
+        }
+    }
+}
+
 /// versa-kbm actuator behind the same [`Kbm`] port as the other backends.
 pub struct VkbmKbm {
     guard: ActuationGuard,
     client: Client,
     timeout: Duration,
+    /// How the pointer is placed before a click (§11.3).
+    move_mode: MoveMode,
     /// Dry-run state at init, so `smoke_echo` restores it faithfully.
     dry_run_at_init: bool,
 }
@@ -602,15 +893,18 @@ impl VkbmKbm {
     /// Opens the vendor control channel, then handshakes: ping for liveness,
     /// info for the protocol version and the device gate states. The
     /// protocol major must match or init refuses - a silent mismatch would
-    /// click wrong.
+    /// click wrong. Modes that move relatively additionally require the
+    /// firmware minor that introduced the true relative pointer.
     ///
     /// # Errors
     /// Device not found or not openable, no ack to the ping/info, protocol
-    /// major mismatch.
+    /// major mismatch, or a relative mode on firmware without the relative
+    /// pointer.
     pub fn new(
         vid: u16,
         pid: u16,
         ack_timeout_ms: u64,
+        move_mode: MoveMode,
         require_foreground: bool,
         focus_if_needed: bool,
         game: GameWindow,
@@ -640,6 +934,12 @@ impl VkbmKbm {
                  v{PROTOCOL_MAJOR}.x - flash a matching firmware"
             );
         }
+        if relative_requested(move_mode) && minor < RELATIVE_FW_MINOR {
+            bail!(
+                "versa-kbm firmware v{major}.{minor} predates the true relative pointer (needs \
+                 0.5+); flash a newer firmware or set backend.vkbm.move_mode = \"abs\""
+            );
+        }
         let dry_run_at_init = flags & wire::info_flags::DRY_RUN != 0;
         let switch = flags & wire::info_flags::SWITCH_ON != 0;
         let armed = flags & wire::info_flags::ARMED != 0;
@@ -667,6 +967,7 @@ impl VkbmKbm {
             guard: ActuationGuard::new(require_foreground, focus_if_needed, game),
             client,
             timeout,
+            move_mode,
             dry_run_at_init,
         })
     }
@@ -716,27 +1017,11 @@ impl Kbm for VkbmKbm {
         if !self.guard.still_prepared("vkbm press") {
             return;
         }
-        // HID absolute reports are normalized across the primary monitor
-        // only. A target outside it is unreachable, and sending one anyway
-        // would click wherever the clamped point lands - possibly another
-        // window. Skip instead; `doctor` reports the placement problem.
-        if !point_in_primary((sx, sy), screen_size()) {
-            warn!(
-                action = "press",
-                screen_x = sx,
-                screen_y = sy,
-                "target outside the primary monitor - the absolute HID mouse cannot reach \
-                 it; skipping (make the WoW display the primary display)"
-            );
-            return;
-        }
         let (w, h) = screen_size();
-        let cmd = wire::Cmd::ClickAbs { x: to_abs(sx, w), y: to_abs(sy, h) };
-        let outcome = self.client.request(cmd, self.timeout);
-        let acked = matches!(&outcome, Ok(wire::Reply::Ok | wire::Reply::Echo));
-        report_actuation("press", cmd, outcome);
-        if acked {
-            info!(client_x = x, client_y = y, screen_x = sx, screen_y = sy, "press sent");
+        if wants_relative(self.move_mode, (sx, sy), (w, h)) {
+            self.press_relative(sx, sy);
+        } else {
+            self.press_abs(x, y, sx, sy, w, h);
         }
     }
 
@@ -755,15 +1040,151 @@ impl Kbm for VkbmKbm {
     }
 
     fn cursor(&self) -> (i32, i32) {
-        // The device moves the real OS cursor, so reading it back is honest
-        // diagnostics (unlike the serial backend, which has no read-back).
-        let mut pt = POINT { x: 0, y: 0 };
-        // SAFETY: plain cursor query into a local struct.
-        if unsafe { GetCursorPos(&raw mut pt) }.is_ok() {
-            (pt.x, pt.y)
-        } else {
-            (0, 0)
+        read_cursor()
+    }
+}
+
+impl VkbmKbm {
+    /// The absolute fast path: one `ClickAbs` report. Primary-monitor bound
+    /// (Windows normalizes absolute HID mice across the primary only), so a
+    /// target outside it is skipped rather than clamped into some other
+    /// window; `doctor` reports the placement problem.
+    fn press_abs(&mut self, x: i32, y: i32, sx: i32, sy: i32, w: i32, h: i32) {
+        if !point_in_primary((sx, sy), (w, h)) {
+            warn!(
+                action = "press",
+                screen_x = sx,
+                screen_y = sy,
+                "target outside the primary monitor - move_mode = \"abs\" cannot reach it; \
+                 skipping (set move_mode = \"relative\"/\"auto\" or make WoW the primary display)"
+            );
+            return;
         }
+        let cmd = wire::Cmd::ClickAbs { x: to_abs(sx, w), y: to_abs(sy, h) };
+        let outcome = self.client.request(cmd, self.timeout);
+        let acked = matches!(&outcome, Ok(wire::Reply::Ok | wire::Reply::Echo));
+        report_actuation("press", cmd, outcome);
+        if acked {
+            info!(client_x = x, client_y = y, screen_x = sx, screen_y = sy, "press sent (abs)");
+        }
+    }
+
+    /// The closed-loop path (§11.3): converge the OS cursor onto the target
+    /// with true relative reports, then click through the same pointer.
+    /// Works on every monitor; costs a few round-trips instead of one
+    /// report, and refuses to click when the move did not verify.
+    fn press_relative(&mut self, sx: i32, sy: i32) {
+        // Anchor the press routing to the relative pointer before anything
+        // else: a zero delta emits no report but flips the device's "pointer
+        // that moved last", so the click can never ride the absolute pointer
+        // and yank the cursor to its stale anchor (a zero-error converge
+        // sends no relative report of its own).
+        let route = wire::Cmd::MoveRel { dx: 0, dy: 0 };
+        let outcome = self.client.request(route, self.timeout);
+        let routed = matches!(&outcome, Ok(wire::Reply::Ok | wire::Reply::Echo));
+        report_actuation("press", route, outcome);
+        if !routed {
+            return;
+        }
+        let (landed, nudges) = {
+            let mut pointer = OsRelPointer { client: &mut self.client, timeout: self.timeout };
+            match converge(&mut pointer, (sx, sy), CONVERGE_DEADLINE) {
+                Ok(ok) => ok,
+                Err(MoveError::Stalled { err }) => {
+                    warn!(
+                        action = "press",
+                        screen_x = sx,
+                        screen_y = sy,
+                        missed_x = err.0,
+                        missed_y = err.1,
+                        "relative move did not converge; skipping (never click at an unverified \
+                         position)"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        action = "press",
+                        screen_x = sx,
+                        screen_y = sy,
+                        error = %e,
+                        "relative move did not converge; skipping (never click at an unverified \
+                         position)"
+                    );
+                    return;
+                }
+            }
+        };
+        // The move took tens of ms; re-check the foreground policy before
+        // the click lands (same TOCTOU as everywhere else).
+        if !self.guard.still_prepared("vkbm press") {
+            return;
+        }
+        let down_executed = self.press_button(true);
+        if down_executed {
+            thread::sleep(CLICK_HOLD);
+        }
+        let up_executed = self.press_button(false);
+        if down_executed && !up_executed {
+            // The down may have landed with the up lost: the button can be
+            // latched, so release everything as best-effort recovery
+            // (release-class on the device, always allowed).
+            let outcome = self.client.request(wire::Cmd::ReleaseAll, self.timeout);
+            report_actuation("press", wire::Cmd::ReleaseAll, outcome);
+        }
+        if down_executed && up_executed {
+            info!(
+                screen_x = sx,
+                screen_y = sy,
+                landed_x = landed.0,
+                landed_y = landed.1,
+                nudges,
+                "press sent (relative)"
+            );
+        }
+    }
+
+    /// One half of a relative-mode click. The up is attempted even after a
+    /// lost down: a release is always safe (release-class on the device)
+    /// and unlatches the button whether or not the down landed. Returns
+    /// whether the button physically changed state (dry-run echoes count
+    /// as "not actuated" and are logged as such).
+    fn press_button(&mut self, down: bool) -> bool {
+        let cmd = if down { wire::Cmd::MouseDown } else { wire::Cmd::MouseUp };
+        match self.client.request(cmd, self.timeout) {
+            Ok(wire::Reply::Ok) => true,
+            Ok(wire::Reply::Echo) => {
+                warn!(action = "press", command = %cmd, "vkbm dry-run echo (not actuated)");
+                false
+            }
+            Ok(wire::Reply::Err(code)) => {
+                warn!(action = "press", command = %cmd, "vkbm refused: {code}");
+                false
+            }
+            Ok(other) => {
+                warn!(action = "press", command = %cmd, "vkbm unexpected reply {other:?}");
+                false
+            }
+            Err(RequestError::Lost) => {
+                warn!(action = "press", command = %cmd, "vkbm ack lost - button state unknown");
+                false
+            }
+            Err(RequestError::Link(e)) => {
+                warn!(action = "press", command = %cmd, "vkbm transport failed: {e}");
+                false
+            }
+        }
+    }
+}
+
+/// Current OS cursor position in screen coordinates.
+fn read_cursor() -> (i32, i32) {
+    let mut pt = POINT { x: 0, y: 0 };
+    // SAFETY: plain cursor query into a local struct.
+    if unsafe { GetCursorPos(&raw mut pt) }.is_ok() {
+        (pt.x, pt.y)
+    } else {
+        (0, 0)
     }
 }
 
@@ -772,19 +1193,30 @@ mod tests {
     use std::time::Duration;
 
     use super::{
+        converge,
         initial_seq,
         issue,
         point_in_primary,
+        relative_requested,
+        scale_axis,
         to_abs,
         wait_ack,
+        wants_relative,
         wire,
         Client,
+        MoveError,
+        Nudged,
+        RelPointer,
         ABS_MAX,
+        CONVERGE_DEADLINE,
     };
-    use crate::adapters::kbm::vkbm::{
-        Link,
-        LinkError,
-        RequestError,
+    use crate::{
+        adapters::kbm::vkbm::{
+            Link,
+            LinkError,
+            RequestError,
+        },
+        config::MoveMode,
     };
 
     const TIMEOUT: Duration = Duration::from_millis(250);
@@ -840,6 +1272,29 @@ mod tests {
         assert_eq!(buf[0], 7);
         assert_eq!(buf[1], 0x01, "ping tag");
         assert!(buf[2..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn encodes_relative_moves_little_endian() {
+        let mut out = [0u8; 64];
+        wire::encode(wire::Cmd::MoveRel { dx: -300, dy: 400 }, 7, &mut out);
+        assert_eq!(out[0], 7);
+        assert_eq!(out[1], 0x21);
+        assert_eq!(&out[2..4], &(-300i16).to_le_bytes());
+        assert_eq!(&out[4..6], &(400i16).to_le_bytes());
+        assert!(out[6..].iter().all(|&b| b == 0), "rest must stay zero padding");
+    }
+
+    #[test]
+    fn encodes_mouse_down_up_as_left_button() {
+        let mut out = [0u8; 64];
+        wire::encode(wire::Cmd::MouseDown, 1, &mut out);
+        assert_eq!(out[1], 0x22);
+        assert_eq!(out[2], wire::BUTTON_LEFT);
+        wire::encode(wire::Cmd::MouseUp, 2, &mut out);
+        assert_eq!(out[1], 0x23);
+        assert_eq!(out[2], wire::BUTTON_LEFT);
+        assert!(out[3..].iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -1090,5 +1545,210 @@ mod tests {
         assert!(!point_in_primary((100, 1080), (1920, 1080)));
         assert!(!point_in_primary((-1, 5), (1920, 1080)));
         assert!(!point_in_primary((5, -1), (1920, 1080)));
+    }
+
+    // --- movement modes ---
+
+    #[test]
+    fn relative_mode_moves_everywhere_and_abs_only_on_the_primary() {
+        let off_primary = (2500, 400);
+        assert!(wants_relative(MoveMode::Relative, off_primary, (1920, 1080)));
+        assert!(wants_relative(MoveMode::Relative, (960, 540), (1920, 1080)));
+        assert!(!wants_relative(MoveMode::Abs, (960, 540), (1920, 1080)));
+        assert!(!wants_relative(MoveMode::Abs, off_primary, (1920, 1080)));
+        // Auto: the absolute fast path on the primary, closed loop beyond.
+        assert!(!wants_relative(MoveMode::Auto, (960, 540), (1920, 1080)));
+        assert!(wants_relative(MoveMode::Auto, off_primary, (1920, 1080)));
+        // Only the relative-moving modes need the fw 0.5 capability.
+        assert!(relative_requested(MoveMode::Relative));
+        assert!(relative_requested(MoveMode::Auto));
+        assert!(!relative_requested(MoveMode::Abs));
+    }
+
+    // --- closed loop ---
+
+    /// A cursor world for converge tests: a position plus a ballistics gain
+    /// function applied per sent axis. No hardware, no Windows.
+    struct FakePointer {
+        pos: (i32, i32),
+        gain: fn(i32) -> f64,
+        /// Nudges the cursor ignores (pinned/blocked cursor).
+        inert: bool,
+        /// Nudges are echoed instead of executed (device dry-run).
+        dry_run: bool,
+        /// Error returned instead of moving (e.g. lost acks).
+        fail: Option<MoveError>,
+        nudges: Vec<(i16, i16)>,
+    }
+
+    impl FakePointer {
+        fn at(pos: (i32, i32), gain: fn(i32) -> f64) -> Self {
+            Self { pos, gain, inert: false, dry_run: false, fail: None, nudges: Vec::new() }
+        }
+    }
+
+    impl RelPointer for FakePointer {
+        fn read(&self) -> (i32, i32) {
+            self.pos
+        }
+
+        #[allow(clippy::cast_possible_truncation)] // test world is unbounded
+        fn nudge(&mut self, dx: i16, dy: i16) -> Result<Nudged, MoveError> {
+            self.nudges.push((dx, dy));
+            if let Some(e) = self.fail.take() {
+                return Err(e);
+            }
+            if self.dry_run {
+                return Ok(Nudged::Echoed);
+            }
+            if !self.inert {
+                self.pos.0 += (f64::from(dx) * (self.gain)(i32::from(dx))).round() as i32;
+                self.pos.1 += (f64::from(dy) * (self.gain)(i32::from(dy))).round() as i32;
+            }
+            Ok(Nudged::Moved)
+        }
+    }
+
+    fn unit(_: i32) -> f64 {
+        1.0
+    }
+
+    fn half(_: i32) -> f64 {
+        0.5
+    }
+
+    /// High gain for large sends, 1:1 for corrections - the shape of real
+    /// Windows ballistics (gain is a function of speed).
+    fn epp_like(speed: i32) -> f64 {
+        match speed.abs() {
+            0..=3 => 1.0,
+            4..=11 => 1.5,
+            12..=47 => 3.0,
+            _ => 6.0,
+        }
+    }
+
+    /// 20x on large sends (the max pointer-speed setting), 1:1 on small.
+    fn twenty_on_large(speed: i32) -> f64 {
+        if speed.abs() > 500 {
+            20.0
+        } else {
+            1.0
+        }
+    }
+
+    /// A flat 20x on every send including 1-count corrections: the
+    /// pathological setting where 1 px can never be hit.
+    fn flat_twenty(_: i32) -> f64 {
+        20.0
+    }
+
+    #[test]
+    fn converges_in_one_probe_at_unit_gain() -> Result<(), MoveError> {
+        let mut p = FakePointer::at((100, 100), unit);
+        let (pos, nudges) = converge(&mut p, (500, 500), CONVERGE_DEADLINE)?;
+        assert_eq!(pos, (500, 500));
+        assert_eq!(nudges, 1, "1:1 ballistics: the probe lands exactly");
+        Ok(())
+    }
+
+    #[test]
+    fn converges_at_half_gain_with_one_correction() -> Result<(), MoveError> {
+        let mut p = FakePointer::at((0, 0), half);
+        let (pos, nudges) = converge(&mut p, (400, 200), CONVERGE_DEADLINE)?;
+        assert_eq!(pos, (400, 200));
+        assert_eq!(nudges, 2, "probe + gain-scaled correction");
+        Ok(())
+    }
+
+    #[test]
+    fn converges_at_max_pointer_speed_gain() -> Result<(), MoveError> {
+        let mut p = FakePointer::at((0, 0), twenty_on_large);
+        let (pos, nudges) = converge(&mut p, (1000, 300), CONVERGE_DEADLINE)?;
+        assert_eq!(pos, (1000, 300));
+        assert!(nudges <= 4, "adaptive gain must not need brute force");
+        Ok(())
+    }
+
+    #[test]
+    fn converges_through_epp_style_curve() -> Result<(), MoveError> {
+        let mut p = FakePointer::at((0, 0), epp_like);
+        let (pos, nudges) = converge(&mut p, (1000, 400), CONVERGE_DEADLINE)?;
+        assert!(
+            (pos.0 - 1000).abs() <= 1 && (pos.1 - 400).abs() <= 1,
+            "lands within the click tolerance, got {pos:?}"
+        );
+        assert!(nudges <= 4);
+        Ok(())
+    }
+
+    #[test]
+    fn flat_extreme_gain_stalls_instead_of_clicking_wild() {
+        // 20x on 1-count sends means sub-pixel targets are unreachable; the
+        // loop must refuse to click rather than guess.
+        let mut p = FakePointer::at((0, 0), flat_twenty);
+        let outcome = converge(&mut p, (3, 0), CONVERGE_DEADLINE);
+        assert!(matches!(outcome, Err(MoveError::Stalled { .. })));
+    }
+
+    #[test]
+    fn pinned_cursor_reports_pinned() {
+        let mut p = FakePointer::at((0, 0), unit);
+        p.inert = true;
+        let outcome = converge(&mut p, (300, 300), CONVERGE_DEADLINE);
+        assert!(matches!(outcome, Err(MoveError::Pinned)));
+    }
+
+    #[test]
+    fn lost_ack_during_move_aborts_the_click() {
+        let mut p = FakePointer::at((0, 0), unit);
+        p.fail = Some(MoveError::Lost);
+        let outcome = converge(&mut p, (300, 300), CONVERGE_DEADLINE);
+        assert!(matches!(outcome, Err(MoveError::Lost)));
+    }
+
+    #[test]
+    fn dry_run_echo_is_diagnosed_not_pinned() {
+        // A device in dry-run echoes every nudge without moving: the loop
+        // must say "dry-run", not misreport a pinned cursor.
+        let mut p = FakePointer::at((0, 0), unit);
+        p.dry_run = true;
+        let outcome = converge(&mut p, (300, 300), CONVERGE_DEADLINE);
+        assert!(matches!(outcome, Err(MoveError::DryRun)), "got {outcome:?}");
+    }
+
+    #[test]
+    fn bogus_low_gain_is_capped_not_flinging() {
+        // A near-zero gain measurement (edge clamp, interference) would
+        // scale the next correction to the i16 clamp; the cap must bound it
+        // to twice the remaining error instead of a desktop-span fling.
+        let mut p = FakePointer::at((0, 0), |s| f64::from(s) / 100.0);
+        let target = 3_000;
+        let outcome = converge(&mut p, (target, 0), CONVERGE_DEADLINE);
+        assert!(matches!(outcome, Err(MoveError::Stalled { .. })), "got {outcome:?}");
+        let mut last_err = target;
+        for (dx, _) in p.nudges.iter().skip(1) {
+            assert!(
+                i32::from(*dx) <= 2 * last_err + 16,
+                "correction {dx} flings past the remaining error {last_err}"
+            );
+            last_err -= i32::from(*dx) / 100;
+        }
+    }
+
+    #[test]
+    fn exhausted_deadline_stalls() {
+        let mut p = FakePointer::at((0, 0), unit);
+        let outcome = converge(&mut p, (300, 300), Duration::ZERO);
+        assert!(matches!(outcome, Err(MoveError::Stalled { .. })));
+    }
+
+    #[test]
+    fn scale_axis_rounds_and_clamps_into_i16() {
+        assert_eq!(scale_axis(100, 2.0), 50);
+        assert_eq!(scale_axis(-5, 0.5), -10);
+        assert_eq!(scale_axis(1, 3.0), 0, "sub-half corrections round to zero");
+        assert_eq!(scale_axis(99_999, 1.0), i16::MAX);
+        assert_eq!(scale_axis(-99_999, 1.0), i16::MIN);
     }
 }

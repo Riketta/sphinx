@@ -46,6 +46,8 @@ mod ports;
 use crate::adapters::kbm::SerialKbm;
 #[cfg(feature = "vkbm")]
 use crate::adapters::kbm::VkbmKbm;
+#[cfg(feature = "vkbm")]
+use crate::config::MoveMode;
 use crate::{
     adapters::{
         game_window::{
@@ -316,6 +318,7 @@ fn build_kbm(cfg: &Config, dry_run: bool, game: GameWindow) -> anyhow::Result<An
                     vkbm.vid,
                     vkbm.pid,
                     vkbm.ack_timeout_ms,
+                    vkbm.move_mode,
                     cfg.require_foreground,
                     cfg.focus_if_needed,
                     game.clone(),
@@ -457,6 +460,14 @@ fn doctor(cfg: &Config, smoke: bool) -> anyhow::Result<()> {
     #[cfg(feature = "vkbm")]
     {
         failures += doctor_vkbm_placement(cfg);
+    }
+    #[cfg(feature = "vkbm")]
+    if cfg.backend.kind == BackendKind::Vkbm {
+        // The handshake (and with it the firmware-minor capability gate for
+        // the configured move mode) runs on every doctor pass, not only
+        // under --smoke: a board that cannot serve the configured mode is
+        // an environment failure, not a bench extra.
+        failures += doctor_vkbm_link(cfg, smoke)?;
     }
     failures += doctor_smoke(cfg, smoke)?;
 
@@ -634,15 +645,17 @@ fn doctor_kill(cfg: &Config) {
     }
 }
 
-/// Returns 1 when the game window lies outside the primary monitor: the
-/// vkbm backend's absolute HID mapping is primary-bound (Windows normalizes
-/// absolute mice to the primary display), so targets there would be skipped
-/// at actuation time. `doctor` is where that misconfiguration is diagnosed.
+/// Returns 1 only when the game window lies outside the primary monitor
+/// AND the configured move mode cannot reach it: absolute HID reports are
+/// normalized to the primary display, while the closed-loop relative path
+/// reaches every monitor - so off-primary placement is only a failure for
+/// `move_mode = "abs"`, and informational otherwise.
 #[cfg(feature = "vkbm")]
 fn doctor_vkbm_placement(cfg: &Config) -> usize {
     if cfg.backend.kind != BackendKind::Vkbm {
         return 0;
     }
+    let mode = cfg.backend.vkbm.as_ref().map_or_else(MoveMode::default, |v| v.move_mode);
     // A missing window is doctor_window's finding; placement needs one.
     let Some(info) =
         GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref()).find()
@@ -661,10 +674,11 @@ fn doctor_vkbm_placement(cfg: &Config) -> usize {
             origin_y = oy,
             primary_width = w,
             primary_height = h,
+            ?mode,
             "vkbm placement: game window on the primary monitor"
         );
         0
-    } else {
+    } else if mode == MoveMode::Abs {
         warn!(
             origin_x = ox,
             origin_y = oy,
@@ -672,12 +686,54 @@ fn doctor_vkbm_placement(cfg: &Config) -> usize {
             client_height = info.client.1,
             primary_width = w,
             primary_height = h,
-            "vkbm placement: game window outside the primary monitor - HID absolute input \
-             cannot reach it, actuation will be skipped; make the WoW display the primary \
-             display"
+            "vkbm placement: game window outside the primary monitor - move_mode = \"abs\" \
+             cannot reach it, actuation will be skipped; set move_mode = \"relative\" or make \
+             the WoW display the primary display"
         );
         1
+    } else {
+        info!(
+            origin_x = ox,
+            origin_y = oy,
+            client_width = info.client.0,
+            client_height = info.client.1,
+            primary_width = w,
+            primary_height = h,
+            ?mode,
+            "vkbm placement: game window outside the primary monitor - the closed-loop \
+             relative path reaches it"
+        );
+        0
     }
+}
+
+/// Returns 1 when the vkbm link fails its handshake - device missing, no
+/// ack, protocol mismatch, or the configured move mode asking for a
+/// relative pointer on firmware older than 0.5. With `smoke`, additionally
+/// runs the dry-run echo round-trip (nothing actuates).
+#[cfg(feature = "vkbm")]
+fn doctor_vkbm_link(cfg: &Config, smoke: bool) -> anyhow::Result<usize> {
+    let vkbm = cfg.backend.vkbm.clone().unwrap_or_default();
+    let mut kbm = match VkbmKbm::new(
+        vkbm.vid,
+        vkbm.pid,
+        vkbm.ack_timeout_ms,
+        vkbm.move_mode,
+        cfg.require_foreground,
+        cfg.focus_if_needed,
+        GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref()),
+    ) {
+        Ok(kbm) => kbm,
+        Err(e) => {
+            warn!(error = %e, "vkbm link: handshake failed");
+            return Ok(1);
+        }
+    };
+    if smoke {
+        kbm.smoke_echo().context("smoke: vkbm dry-run echo failed")?;
+        info!("smoke: vkbm link verified (handshake + dry-run echo)");
+    }
+    Ok(0)
 }
 
 /// Returns 1 when the smoke test was requested and failed.
@@ -706,26 +762,9 @@ fn doctor_smoke(cfg: &Config, smoke: bool) -> anyhow::Result<usize> {
         return Ok(0); // validate() already refused this combination
     }
     if cfg.backend.kind == BackendKind::Vkbm {
-        // A vkbm build's smoke test is the handshake (ping + info + protocol
-        // check) plus a dry-run echo round-trip: the device runs its full
-        // command path while actuating nothing.
-        #[cfg(feature = "vkbm")]
-        {
-            let vkbm = cfg.backend.vkbm.clone().unwrap_or_default();
-            let mut kbm = VkbmKbm::new(
-                vkbm.vid,
-                vkbm.pid,
-                vkbm.ack_timeout_ms,
-                cfg.require_foreground,
-                cfg.focus_if_needed,
-                GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref()),
-            )
-            .context("smoke: vkbm handshake failed")?;
-            kbm.smoke_echo().context("smoke: vkbm dry-run echo failed")?;
-            return Ok(0);
-        }
-        #[cfg(not(feature = "vkbm"))]
-        return Ok(0); // validate() already refused this combination
+        // The vkbm link check (handshake + capability gate) is doctoring's
+        // always-on `doctor_vkbm_link`; the dry-run echo rides `smoke`.
+        return Ok(0);
     }
     let mut kbm = SendInputKbm::new(
         false,
