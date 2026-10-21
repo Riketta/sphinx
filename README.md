@@ -16,7 +16,13 @@ before every actuation, strobe watchdog (white >10s -> idle, never
 re-actuate), one actuation per rising edge, and a polled kill hotkey
 (default `ctrl+alt+f12`, configurable via `kill_hotkey` in `sphinx.toml`)
 that exits between actuations - an in-flight relative move (worst case
-~2 s) finishes first; BOOTSEL on the board is the instant stop.
+~2 s) finishes first; BOOTSEL on the board is the instant stop. A
+humanized layer (config: `jitter_px`, `hold_ms`, `hold_jitter_pct`,
+`settle_jitter_pct`, `reaction_min_ms`/`reaction_max_ms`) offsets each
+click target by a few px, jitters the click hold and converge pacing,
+and pauses a randomized 15-50 ms before pressing - so repeated buys
+do not land on the same pixel at machine-constant timing. ABORT is
+never delayed or jittered.
 
 ## Getting started (end to end)
 

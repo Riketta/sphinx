@@ -1,5 +1,5 @@
 //! Inbound adapter: the kill hotkey, polled via `GetAsyncKeyState` (no
-//! global hook, §3.6). The key combination itself is config-driven
+//! global hook). The key combination itself is config-driven
 //! (`kill_hotkey = "ctrl+alt+f12"` by default) — nothing is hardcoded.
 
 use tracing::trace;

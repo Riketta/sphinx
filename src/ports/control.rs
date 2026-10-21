@@ -1,4 +1,4 @@
-//! Inbound port: the kill switch (§3.6).
+//! Inbound port: the kill switch.
 
 /// Human override input: when this reports true, the loop exits immediately.
 pub trait ControlInput {

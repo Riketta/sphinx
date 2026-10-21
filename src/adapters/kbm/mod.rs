@@ -1,7 +1,8 @@
 //! Outbound KBM backends. All implement the same [`Kbm`]
-//! port (§5.4): `sendinput` is the default; `serial` (hardware input, §8)
-//! builds behind the `serial` cargo feature; the `window`-message fallback
-//! follows the plan (§5.4b) when needed.
+//! port: `sendinput` is the default; `serial` (bench-grade hardware input)
+//! builds behind the `serial` cargo feature; the `vkbm` RP2040 dongle is
+//! the default build; a `window`-message fallback exists only as a
+//! rejected plan option.
 
 pub mod guard;
 pub mod sendinput;

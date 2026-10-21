@@ -1,5 +1,5 @@
-//! `serial` KBM backend (PLAN §8, v2 hardware input): a UART -> HID dongle /
-//! MCU (CH9329-class, or a Pro Micro sketch) speaking the plan's line
+//! `serial` KBM backend (bench-grade hardware input): a UART -> HID dongle /
+//! MCU (CH9329-class, or a Pro Micro sketch) speaking a line
 //! protocol - `C <x> <y>\n` press, `K <code>\n` key, `P\n` ping, each acked
 //! with `OK\n`. Built only with `--features serial`; `sphinx.toml` selects it
 //! with `backend.kind = "serial"`. The domain never sees any of this: same

@@ -23,3 +23,17 @@ pub trait Kbm {
     /// Current pointer position in screen coordinates (diagnostics only).
     fn cursor(&self) -> (i32, i32);
 }
+
+/// Click-timing shape for the humanized layer: the down->up hold, and how
+/// much the hold and the closed-loop settle gaps are randomized.
+#[derive(Clone, Copy, Debug)]
+pub struct PressTiming {
+    /// Base down->up hold for a click (ms).
+    pub hold_ms: u64,
+    /// Hold randomized +-this percent around the base (0 = exact).
+    pub hold_jitter_pct: u64,
+    /// Converge settle gaps randomized +-this percent (0 = exact). Only
+    /// the closed-loop (vkbm) backend has settle gaps.
+    #[cfg_attr(not(feature = "vkbm"), expect(dead_code))]
+    pub settle_jitter_pct: u64,
+}

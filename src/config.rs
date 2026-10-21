@@ -19,22 +19,22 @@ use crate::adapters::{
     },
 };
 
-/// Poll period default: 50 ms = 20 Hz (contract minimum, §3.4).
+/// Poll period default: 50 ms = 20 Hz, the semaphore's minimum.
 fn d_poll_ms() -> u64 {
     50
 }
 
-/// Kill hotkey default (§3.6). Change freely in `sphinx.toml`.
+/// Kill hotkey default. Change freely in `sphinx.toml`.
 fn d_kill_hotkey() -> String {
     "ctrl+alt+f12".to_string()
 }
 
-/// Debounce default: two polls >=25 ms apart (§3.3 step 3).
+/// Debounce default: two polls >=25 ms apart.
 fn d_debounce_ms() -> u64 {
     25
 }
 
-/// Strobe watchdog default (§3.6).
+/// Strobe watchdog default.
 fn d_watchdog_ms() -> u64 {
     10_000
 }
@@ -50,6 +50,35 @@ fn d_min_interval_ms() -> u64 {
 /// logged) instead of a clicking fit.
 fn d_max_per_min() -> u32 {
     30
+}
+
+/// Humanized default: +-3 px on a target that sits well inside a button.
+fn d_jitter_px() -> u32 {
+    3
+}
+
+/// Humanized default: an alert human's click hold, in the 30-40 ms band.
+fn d_hold_ms() -> u64 {
+    35
+}
+
+/// Humanized default: hold randomized a fifth around its base.
+fn d_hold_jitter_pct() -> u64 {
+    20
+}
+
+/// Humanized default: converge settle gaps randomized a quarter.
+fn d_settle_jitter_pct() -> u64 {
+    25
+}
+
+/// Humanized default: as low as possible while not instant.
+fn d_reaction_min_ms() -> u64 {
+    15
+}
+
+fn d_reaction_max_ms() -> u64 {
+    50
 }
 
 fn d_true() -> bool {
@@ -83,7 +112,7 @@ fn d_vkbm_move_profile() -> String {
     "move-profile.toml".to_string()
 }
 
-/// A client-area physical pixel point (§3.7).
+/// A client-area physical pixel point.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Point {
@@ -289,6 +318,26 @@ pub struct Config {
     /// Burst guard: rolling per-minute actuation ceiling (>= 1).
     #[serde(default = "d_max_per_min")]
     pub max_actuations_per_min: u32,
+    /// Click targets are offset uniformly by +-this many px per axis
+    /// (humanized; 0 = exact to the configured point).
+    #[serde(default = "d_jitter_px")]
+    pub jitter_px: u32,
+    /// Base down->up hold for a click in ms (humanized).
+    #[serde(default = "d_hold_ms")]
+    pub hold_ms: u64,
+    /// Hold time randomized +-this percent around `hold_ms`.
+    #[serde(default = "d_hold_jitter_pct")]
+    pub hold_jitter_pct: u64,
+    /// Closed-loop settle gaps randomized +-this percent.
+    #[serde(default = "d_settle_jitter_pct")]
+    pub settle_jitter_pct: u64,
+    /// Humanized reaction pause before a press: uniform in
+    /// `[reaction_min_ms, reaction_max_ms]` (max 0 = disabled). ABORT is
+    /// never delayed.
+    #[serde(default = "d_reaction_min_ms")]
+    pub reaction_min_ms: u64,
+    #[serde(default = "d_reaction_max_ms")]
+    pub reaction_max_ms: u64,
     /// Semaphore pixel points (required — no safe default exists).
     pub pixels: PixelPoints,
     /// Target button points (required — no safe default exists).
@@ -408,6 +457,28 @@ impl Config {
         if !(1..=600).contains(&self.max_actuations_per_min) {
             bail!("max_actuations_per_min {} outside 1..=600", self.max_actuations_per_min);
         }
+        // Humanized layer bounds. The reaction cap is half the device's
+        // replay-window headroom argument from the ack timeout: a pause is
+        // never a reason to approach any timeout.
+        if self.jitter_px > 20 {
+            bail!("jitter_px {} outside 0..=20", self.jitter_px);
+        }
+        if !(5..=500).contains(&self.hold_ms) {
+            bail!("hold_ms {} outside 5..=500", self.hold_ms);
+        }
+        if self.hold_jitter_pct > 100 {
+            bail!("hold_jitter_pct {} outside 0..=100", self.hold_jitter_pct);
+        }
+        if self.settle_jitter_pct > 100 {
+            bail!("settle_jitter_pct {} outside 0..=100", self.settle_jitter_pct);
+        }
+        if self.reaction_max_ms > 1000 || self.reaction_min_ms > self.reaction_max_ms {
+            bail!(
+                "reaction_ms must be 0..=1000 with min <= max (got {}..={})",
+                self.reaction_min_ms,
+                self.reaction_max_ms
+            );
+        }
         self.validate_kill_hotkey()?;
         // Case-insensitive like the kill hotkey parser: `"Escape"` must not
         // fail where `"escape"` works.
@@ -487,7 +558,7 @@ impl Config {
                         })
                         .unwrap_or_default();
                     bail!(
-                        "backend.kind = \"vkbm\" is versa-kbm hardware input (PLAN §11.4); \
+                        "backend.kind = \"vkbm\" is versa-kbm hardware input; \
                          rebuild with --features vkbm{detail}"
                     );
                 }
@@ -606,6 +677,13 @@ mod tests {
         assert!(validated(|cfg| cfg.min_actuation_interval_ms = 60_001).is_err());
         assert!(validated(|cfg| cfg.max_actuations_per_min = 0).is_err());
         assert!(validated(|cfg| cfg.max_actuations_per_min = 601).is_err());
+        assert!(validated(|cfg| cfg.jitter_px = 21).is_err());
+        assert!(validated(|cfg| cfg.hold_ms = 4).is_err());
+        assert!(validated(|cfg| cfg.hold_ms = 501).is_err());
+        assert!(validated(|cfg| cfg.hold_jitter_pct = 101).is_err());
+        assert!(validated(|cfg| cfg.settle_jitter_pct = 101).is_err());
+        assert!(validated(|cfg| cfg.reaction_min_ms = 60).is_err()); // min > max (50)
+        assert!(validated(|cfg| cfg.reaction_max_ms = 1001).is_err());
         assert!(validated(|cfg| cfg.screen = Some(ScreenRef { width: 0, height: 1080 })).is_err());
     }
 

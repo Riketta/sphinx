@@ -2,6 +2,7 @@
 
 pub mod control;
 pub mod kbm;
+pub mod random;
 pub mod semaphore;
 
 pub use control::ControlInput;

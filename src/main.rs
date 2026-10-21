@@ -77,6 +77,7 @@ use crate::{
         },
         kbm::SendInputKbm,
         pixel_reader::PixelReader,
+        random::OsRandom,
     },
     config::{
         BackendKind,
@@ -92,6 +93,7 @@ use crate::{
         StepOutcome,
     },
     ports::{
+        kbm::PressTiming,
         Kbm,
         Key,
     },
@@ -362,6 +364,7 @@ fn build_kbm(cfg: &Config, dry_run: bool, game: GameWindow) -> anyhow::Result<An
                     cfg.focus_if_needed,
                     game.clone(),
                     move_profile,
+                    press_timing(cfg),
                 )
                 .context("vkbm link init failed")?,
             ));
@@ -373,9 +376,18 @@ fn build_kbm(cfg: &Config, dry_run: bool, game: GameWindow) -> anyhow::Result<An
         );
     }
     Ok(AnyKbm::Live(
-        SendInputKbm::new(cfg.require_foreground, cfg.focus_if_needed, game)
+        SendInputKbm::new(cfg.require_foreground, cfg.focus_if_needed, game, press_timing(cfg))
             .context("enigo init failed")?,
     ))
+}
+
+/// The humanized click-timing shape, straight from the config.
+fn press_timing(cfg: &Config) -> PressTiming {
+    PressTiming {
+        hold_ms: cfg.hold_ms,
+        hold_jitter_pct: cfg.hold_jitter_pct,
+        settle_jitter_pct: cfg.settle_jitter_pct,
+    }
 }
 
 fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
@@ -429,7 +441,11 @@ fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
             watchdog_ms: cfg.watchdog_ms,
             min_actuation_interval_ms: cfg.min_actuation_interval_ms,
             max_actuations_per_min: cfg.max_actuations_per_min,
+            jitter_px: cfg.jitter_px,
+            reaction_min_ms: cfg.reaction_min_ms,
+            reaction_max_ms: cfg.reaction_max_ms,
         },
+        Box::new(OsRandom::from_entropy()),
     );
     info!(
         poll_ms = cfg.poll_ms,
@@ -855,6 +871,7 @@ fn doctor_vkbm_link(cfg: &Config, smoke: bool) -> usize {
         cfg.focus_if_needed,
         GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref()),
         load_move_profile(Path::new(&vkbm.move_profile)),
+        press_timing(cfg),
     ) {
         Ok(kbm) => kbm,
         Err(e) => {
@@ -913,6 +930,7 @@ fn doctor_smoke(cfg: &Config, smoke: bool) -> usize {
         false,
         false,
         GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref()),
+        press_timing(cfg),
     ) {
         Ok(kbm) => kbm,
         Err(e) => {

@@ -1,4 +1,4 @@
-//! `vkbm` KBM backend (PLAN §11.4): the versa-kbm RP2040 dongle, spoken to
+//! `vkbm` KBM backend: the versa-kbm RP2040 dongle, spoken to
 //! over its HID vendor control channel (usage page `0xFF00`). Built only
 //! with `--features vkbm`; `sphinx.toml` selects it with
 //! `backend.kind = "vkbm"`. The domain never sees any of this: same
@@ -74,10 +74,15 @@ use crate::{
             guard::ActuationGuard,
             point_in_primary,
         },
+        random::OsRandom,
     },
     config::MoveMode,
     ports::{
-        kbm::Key,
+        kbm::{
+            Key,
+            PressTiming,
+        },
+        random::jitter_ms,
         Kbm,
     },
 };
@@ -103,10 +108,6 @@ const RELATIVE_FW_MINOR: u8 = 5;
 
 /// Highest coordinate of the HID absolute-mouse mapping (logical maximum).
 const ABS_MAX: u16 = 32_767;
-
-/// How long the held button stays down in a relative-mode click, matching
-/// the device's default tap hold.
-const CLICK_HOLD: Duration = Duration::from_millis(10);
 
 /// Clicks land within this distance of the target (screen px per axis).
 /// Two, not one: a 1-count report can legally move the cursor 0 px (the
@@ -796,12 +797,15 @@ const CHUNK_STREAM_MS: u64 = 8;
 /// `GetCursorPos` samples a half-applied move - measured gains swing
 /// wildly (even invert sign), and the loop thrashes (observed live
 /// 2026-10-20). A short drain makes every measurement complete.
-const REPORT_SETTLE: Duration = Duration::from_millis(25);
+const REPORT_SETTLE_MS: u64 = 25;
 
 /// The real cursor: `GetCursorPos` reads, `MoveRel` requests for nudges.
 struct OsRelPointer<'a> {
     client: &'a mut Client,
     timeout: Duration,
+    /// Randomness for the settle gaps (calibration passes pct 0: exact).
+    rand: &'a mut OsRandom,
+    settle_jitter_pct: u64,
 }
 
 impl RelPointer for OsRelPointer<'_> {
@@ -830,9 +834,11 @@ impl RelPointer for OsRelPointer<'_> {
             Err(RequestError::Link(e)) => Err(MoveError::Transport(e)),
         };
         // The cursor is only trustworthy after the report queue drains
-        // (see `REPORT_SETTLE`): the ack is not the cursor.
+        // (see `REPORT_SETTLE_MS`): the ack is not the cursor. The settle
+        // gap is jittered so the converge duration is not machine-constant.
         if reply.is_ok() {
-            thread::sleep(REPORT_SETTLE);
+            let settle = jitter_ms(REPORT_SETTLE_MS, self.settle_jitter_pct, self.rand);
+            thread::sleep(Duration::from_millis(settle));
         }
         reply
     }
@@ -849,7 +855,7 @@ fn scale_axis(err: i32, gain: f64) -> i16 {
     }
 }
 
-/// Adaptive-gain closed loop (plan §11.3), hardened against real Windows
+/// Adaptive-gain closed loop, hardened against real Windows
 /// ballistics after the first off-primary soak (2026-10-20): the probe
 /// carries the full remaining error under a 1:1 assumption (machines with
 /// ballistics disabled still land in one nudge), then every step
@@ -1027,8 +1033,12 @@ pub struct VkbmKbm {
     guard: ActuationGuard,
     client: Client,
     timeout: Duration,
-    /// How the pointer is placed before a click (§11.3).
+    /// How the pointer is placed before a click.
     move_mode: MoveMode,
+    /// Humanized click timing (hold base + jitter percents).
+    timing: PressTiming,
+    /// Randomness for the humanized timing (hold, settle gaps).
+    rand: OsRandom,
     /// Dry-run state at init, so `smoke_echo` restores it faithfully.
     dry_run_at_init: bool,
     /// Calibration seed for the closed loop: (command counts, measured px
@@ -1058,6 +1068,7 @@ impl VkbmKbm {
         focus_if_needed: bool,
         game: GameWindow,
         move_profile: Vec<(i32, f64)>,
+        timing: PressTiming,
     ) -> anyhow::Result<Self> {
         let timeout = Duration::from_millis(ack_timeout_ms);
         let (client, dry_run_at_init) = open_link(vid, pid, timeout, move_mode)?;
@@ -1066,6 +1077,8 @@ impl VkbmKbm {
             client,
             timeout,
             move_mode,
+            timing,
+            rand: OsRandom::from_entropy(),
             dry_run_at_init,
             move_profile,
         })
@@ -1176,7 +1189,7 @@ impl VkbmKbm {
         delivered
     }
 
-    /// The closed-loop path (§11.3): converge the OS cursor onto the target
+    /// The closed-loop path: converge the OS cursor onto the target
     /// with true relative reports, then click through the same pointer.
     /// Works on every monitor; costs a few round-trips instead of one
     /// report, and refuses to click when the move did not verify.
@@ -1194,7 +1207,12 @@ impl VkbmKbm {
             return false;
         }
         let (landed, nudges) = {
-            let mut pointer = OsRelPointer { client: &mut self.client, timeout: self.timeout };
+            let mut pointer = OsRelPointer {
+                client: &mut self.client,
+                timeout: self.timeout,
+                rand: &mut self.rand,
+                settle_jitter_pct: self.timing.settle_jitter_pct,
+            };
             match converge(&mut pointer, (sx, sy), CONVERGE_DEADLINE, &self.move_profile) {
                 Ok(ok) => ok,
                 Err(MoveError::Stalled { err }) => {
@@ -1248,7 +1266,8 @@ impl VkbmKbm {
         }
         let down = self.press_half(true);
         if matches!(down, HalfOutcome::Executed) {
-            thread::sleep(CLICK_HOLD);
+            let hold = jitter_ms(self.timing.hold_ms, self.timing.hold_jitter_pct, &mut self.rand);
+            thread::sleep(Duration::from_millis(hold));
         }
         let up = self.press_half(false);
         // Recovery: whenever the button may be latched - the down landed but
@@ -1462,7 +1481,12 @@ pub fn calibrate_move(vid: u16, pid: u16, ack_timeout_ms: u64) -> anyhow::Result
     if dry_run_at_init {
         bail!("versa-kbm dry-run is on - run `vkbm dry-run off` before calibrating");
     }
-    let mut pointer = OsRelPointer { client: &mut client, timeout };
+    let mut pointer = OsRelPointer {
+        client: &mut client,
+        timeout,
+        rand: &mut OsRandom::from_entropy(),
+        settle_jitter_pct: 0,
+    };
     let (left, _, right, _) = virtual_desktop_bounds();
     info!(
         sizes = CALIBRATION_SIZES.len(),

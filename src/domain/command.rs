@@ -1,10 +1,10 @@
-//! Domain vocabulary: the §3.2 exact-RGB color contract and the commands it
-//! decodes to. Pure data; no platform code.
+//! Domain vocabulary: the exact-RGB color contract (`docs/semaphore.md`)
+//! and the commands it decodes to. Pure data; no platform code.
 
 use std::fmt;
 
 /// 8-bit RGB triple sampled from a semaphore pixel. Colors are compared
-/// exactly — no blending, no tolerance (§3.2).
+/// exactly — no blending, no tolerance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb {
     /// Red channel.
@@ -39,7 +39,7 @@ impl fmt::Display for Rgb {
     }
 }
 
-/// Action decoded from the CMD pixel color (§3.2).
+/// Action decoded from the CMD pixel color.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     /// `#ff0000`: actuate the native Buyout button.
@@ -80,7 +80,7 @@ mod tests {
     #[test]
     fn idle_and_near_misses_decode_to_none() {
         assert!(Command::from_rgb(Rgb::BLACK).is_none());
-        // Near-misses must be rejected: exact colors only (§3.2).
+        // Near-misses must be rejected: exact colors only.
         assert!(Command::from_rgb(Rgb::new(254, 0, 0)).is_none());
         assert!(Command::from_rgb(Rgb::new(255, 0, 1)).is_none());
         assert!(Command::from_rgb(Rgb::new(1, 2, 3)).is_none());

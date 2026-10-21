@@ -11,6 +11,12 @@ debounce_ms = 25       # same CMD color on two polls at least this far apart
 watchdog_ms = 10000    # strobe white longer than this -> idle, never re-actuate
 min_actuation_interval_ms = 250 # burst guard: two actuations closer than this = runaway, second refused
 max_actuations_per_min = 30     # burst guard: rolling ceiling; excess actuations are skipped (logged)
+jitter_px = 3            # humanize: click targets offset +-this many px per axis (0 = exact)
+hold_ms = 35             # humanize: base down->up hold for a click
+hold_jitter_pct = 20     # humanize: hold randomized +-this percent around the base
+settle_jitter_pct = 25   # humanize: converge settle gaps randomized +-this percent
+reaction_min_ms = 15     # humanize: pre-actuation pause, uniform in [min, max] (0 max disables)
+reaction_max_ms = 50     # humanize: max reaction pause; ABORT is never delayed or jittered
 
 # Calibration reference dumped by `/auctimogger semaphore coords` (doctor compares the
 # live desktop against it; sphinx never derives coordinates from these).

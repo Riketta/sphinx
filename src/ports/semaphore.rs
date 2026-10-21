@@ -1,4 +1,5 @@
-//! Inbound port: reading the semaphore pixels (§3.1/§3.2).
+//! Inbound port: reading the semaphore pixels (the wire contract:
+//! `docs/semaphore.md`).
 
 use crate::domain::Rgb;
 

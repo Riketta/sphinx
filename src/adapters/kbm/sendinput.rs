@@ -1,8 +1,7 @@
-//! Default KBM backend (§5.4a): hardware-level input via enigo
-//! (`SendInput` stream). Honors the foreground policy via the shared
-//! [`ActuationGuard`]: with `require_foreground`, actuation is refused
-//! unless the game window is foreground - sphinx must never click into
-//! another window.
+//! Default KBM backend: hardware-level input via enigo (`SendInput`
+//! stream). Honors the foreground policy via the shared [`ActuationGuard`]:
+//! with `require_foreground`, actuation is refused unless the game window
+//! is foreground - sphinx must never click into another window.
 //!
 //! Coordinate note: the pointer is moved with `SetCursorPos`, which takes
 //! physical virtual-screen coordinates - exactly what the per-monitor-aware
@@ -10,6 +9,11 @@
 //! it normalizes against the *primary* monitor's metrics only (no
 //! `MOUSEEVENTF_VIRTUALDESK`), so on a multi-monitor desktop it would land
 //! clicks somewhere else.
+
+use std::{
+    thread,
+    time::Duration,
+};
 
 use enigo::{
     Button,
@@ -29,9 +33,14 @@ use crate::{
     adapters::{
         game_window::GameWindow,
         kbm::guard::ActuationGuard,
+        random::OsRandom,
     },
     ports::{
-        kbm::Key,
+        kbm::{
+            Key,
+            PressTiming,
+        },
+        random::jitter_ms,
         Kbm,
     },
 };
@@ -40,6 +49,10 @@ use crate::{
 pub struct SendInputKbm {
     guard: ActuationGuard,
     enigo: Enigo,
+    /// Humanized click timing (hold base + jitter percents).
+    timing: PressTiming,
+    /// Randomness for the humanized hold.
+    rand: OsRandom,
 }
 
 /// Moves the cursor to physical virtual-screen coordinates.
@@ -49,8 +62,14 @@ fn move_cursor(sx: i32, sy: i32) -> bool {
     unsafe { SetCursorPos(sx, sy) }.is_ok()
 }
 
+/// Tolerance for the last-instant cursor re-check (px): the click must land
+/// where the policy verified it, not wherever a physical mouse bump left
+/// the cursor.
+const CLICK_TOLERANCE_PX: i32 = 2;
+
 impl SendInputKbm {
-    /// Creates the backend.
+    /// Creates the backend. `timing` shapes the humanized click (hold base
+    /// + jitter percents).
     ///
     /// # Errors
     /// If the enigo backend cannot initialize.
@@ -58,10 +77,13 @@ impl SendInputKbm {
         require_foreground: bool,
         focus_if_needed: bool,
         game: GameWindow,
+        timing: PressTiming,
     ) -> Result<Self, enigo::NewConError> {
         Ok(Self {
             guard: ActuationGuard::new(require_foreground, focus_if_needed, game),
             enigo: Enigo::new(&Settings::default())?,
+            timing,
+            rand: OsRandom::from_entropy(),
         })
     }
 
@@ -88,11 +110,6 @@ impl SendInputKbm {
         Ok(())
     }
 }
-
-/// Tolerance for the last-instant cursor re-check (px): the click must land
-/// where the policy verified it, not wherever a physical mouse bump left
-/// the cursor.
-const CLICK_TOLERANCE_PX: i32 = 2;
 
 impl Kbm for SendInputKbm {
     fn press(&mut self, x: i32, y: i32) -> bool {
@@ -123,8 +140,19 @@ impl Kbm for SendInputKbm {
             );
             return false;
         }
-        if let Err(e) = self.enigo.button(Button::Left, Direction::Click) {
-            warn!(error = %e, "left click failed");
+        // Press + jittered hold + release instead of enigo's atomic Click:
+        // the down->up gap is part of the humanized timing.
+        if let Err(e) = self.enigo.button(Button::Left, Direction::Press) {
+            warn!(error = %e, "left press failed");
+            return false;
+        }
+        let hold = jitter_ms(self.timing.hold_ms, self.timing.hold_jitter_pct, &mut self.rand);
+        thread::sleep(Duration::from_millis(hold));
+        if let Err(e) = self.enigo.button(Button::Left, Direction::Release) {
+            // The button may be latched; one best-effort retry costs
+            // nothing and the release is idempotent.
+            let _ = self.enigo.button(Button::Left, Direction::Release);
+            warn!(error = %e, "left release failed");
             return false;
         }
         info!(client_x = x, client_y = y, screen_x = sx, screen_y = sy, "press sent");

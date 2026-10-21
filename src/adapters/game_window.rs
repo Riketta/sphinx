@@ -78,7 +78,7 @@ pub struct GameWindowInfo {
 
 impl GameWindowInfo {
     /// Translates a client-area point to physical screen coordinates via
-    /// the live window position (§3.7). `None` if the window vanished.
+    /// the live window position. `None` if the window vanished.
     pub fn client_to_screen(&self, x: i32, y: i32) -> Option<(i32, i32)> {
         let mut p = POINT { x, y };
         // SAFETY: hwnd was a valid top-level window moments ago; POINT is a

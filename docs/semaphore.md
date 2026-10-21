@@ -52,7 +52,10 @@ above game UI), `EnableMouse(false)` (input-transparent), anchored to
   ~160 ms worst case); the default closed-loop **relative** path is allowed
   up to ~2 s to converge from any distance and **refuses to click** when it
   cannot verify the landing. The writer's 5 s per-stage timeout absorbs
-  either.
+  either. A configurable humanized layer sits between the edge and the
+  actuation: a uniform reaction pause (default 15–50 ms) and click-position
+  jitter (default ±3 px per axis), so repeated buys do not land on the same
+  pixel at machine-constant timing. ABORT is never delayed or jittered.
 - Writer per-stage ack timeout: 5 s (waiting for the game-event ack). On a
   BUYOUT-stage timeout: ABORT and re-actuate once within the same hand-off
   (the scan hold keeps the screen stable); the 10 s hand-off budget then

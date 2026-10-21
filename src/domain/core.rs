@@ -25,6 +25,10 @@ use crate::{
     },
     ports::{
         kbm::Key,
+        random::{
+            jitter_i32,
+            Random,
+        },
         ControlInput,
         Kbm,
         SemaphoreReader,
@@ -59,6 +63,16 @@ pub struct CoreTiming {
     pub min_actuation_interval_ms: u64,
     /// Burst guard: rolling per-minute actuation ceiling (>= 1).
     pub max_actuations_per_min: u32,
+    /// Click targets are offset by a uniform integer in +-this many px per
+    /// axis before actuation (0 = exact to the configured point). Jitter is
+    /// applied to the TARGET: placement and verification still run on the
+    /// exact point that will be clicked.
+    pub jitter_px: u32,
+    /// Humanized reaction pause before a press, uniform in
+    /// `[reaction_min_ms, reaction_max_ms]` (max 0 = disabled). Never
+    /// applied to ABORT - the escape hatch stays fast.
+    pub reaction_min_ms: u64,
+    pub reaction_max_ms: u64,
 }
 
 /// Lifetime counters for the heartbeat log (soak-session visibility).
@@ -114,6 +128,8 @@ pub struct Core<R, K, C, T> {
     last_guard_warn_ms: Option<u64>,
     /// Lifetime counters (heartbeat).
     stats: CoreStats,
+    /// Humanized-layer randomness (jitter, reaction pause).
+    random: Box<dyn Random>,
 }
 
 impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
@@ -127,6 +143,7 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
         targets: CoreTargets,
         abort_key: Key,
         timing: CoreTiming,
+        random: Box<dyn Random>,
     ) -> Self {
         Self {
             reader,
@@ -142,12 +159,35 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
             recent_actuations: VecDeque::new(),
             last_guard_warn_ms: None,
             stats: CoreStats::default(),
+            random,
         }
     }
 
     /// Lifetime counters (heartbeat logging).
     pub fn stats(&self) -> CoreStats {
         self.stats
+    }
+
+    /// Humanized reaction pause: uniform in the configured range. ABORT
+    /// never calls this (the escape hatch must not be delayed).
+    fn react(&mut self) {
+        let (lo, hi) = (self.timing.reaction_min_ms, self.timing.reaction_max_ms);
+        if hi == 0 || hi < lo {
+            return;
+        }
+        let ms = lo + self.random.below(hi - lo + 1);
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+
+    /// Offsets a click target by a uniform +-`jitter_px` per axis. Jitter
+    /// applies to the TARGET: the backend still places, verifies and clicks
+    /// the exact (jittered) point.
+    fn jitter(&mut self, target: (i32, i32)) -> (i32, i32) {
+        let span = self.timing.jitter_px;
+        (
+            jitter_i32(target.0, span, self.random.as_mut()),
+            jitter_i32(target.1, span, self.random.as_mut()),
+        )
     }
 
     /// Runs one poll. Never panics on bad input: unknown colors are logged
@@ -215,28 +255,32 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
             warn!(color = %sample, "committed CMD is not a known command -> ignored");
             return;
         };
-        // Re-verify immediately before actuation: one fresh read.
+        // The burst guard runs before the humanized pause so a refused
+        // command does not sleep; ABORT is exempt anyway (escape hatch).
+        if !matches!(command, Command::Abort) && !self.guard_allows(now) {
+            return;
+        }
+        if matches!(command, Command::Buyout | Command::Confirm) {
+            self.react();
+        }
+        // Re-verify immediately before actuation: one fresh read. The
+        // humanized pause above widens the edge->click window, so this
+        // check deliberately runs after it.
         let verified = self.reader.read_cmd();
         if verified != sample {
             warn!(expected = %sample, read = %verified, "CMD changed before actuation -> ignored");
             return;
         }
-        // ABORT is the escape hatch and must never be throttled: a skipped
-        // abort leaves the buy dialog stuck until the addon's own stage
-        // timeout. Only purchases carry the burst guard.
-        if !matches!(command, Command::Abort) && !self.guard_allows(now) {
-            return;
-        }
         match command {
             Command::Buyout => {
-                let (x, y) = self.targets.buyout;
+                let (x, y) = self.jitter(self.targets.buyout);
                 info!(x, y, "BUYOUT: pressing native Buyout button");
                 if self.kbm.press(x, y) {
                     self.stats.actuations += 1;
                 }
             }
             Command::Confirm => {
-                let (x, y) = self.targets.confirm;
+                let (x, y) = self.jitter(self.targets.confirm);
                 info!(x, y, "CONFIRM: pressing Buy Now");
                 if self.kbm.press(x, y) {
                     self.stats.actuations += 1;
@@ -317,6 +361,7 @@ mod tests {
         },
         ports::{
             kbm::Key,
+            random::Random,
             ControlInput,
             Kbm,
             SemaphoreReader,
@@ -404,6 +449,32 @@ mod tests {
         kill: &Rc<FakeKill>,
         clock: &Rc<FakeClock>,
     ) -> Core<Rc<FakeReader>, Rc<FakeKbm>, Rc<FakeKill>, Rc<FakeClock>> {
+        make_core_with_timing(
+            reader,
+            kbm,
+            kill,
+            clock,
+            CoreTiming {
+                debounce_ms: 25,
+                watchdog_ms: 10_000,
+                min_actuation_interval_ms: 0,
+                max_actuations_per_min: u32::MAX,
+                // No jitter, no reaction pause: existing tests exercise the
+                // machine on exact coordinates.
+                jitter_px: 0,
+                reaction_min_ms: 0,
+                reaction_max_ms: 0,
+            },
+        )
+    }
+
+    fn make_core_with_timing(
+        reader: &Rc<FakeReader>,
+        kbm: &Rc<FakeKbm>,
+        kill: &Rc<FakeKill>,
+        clock: &Rc<FakeClock>,
+        timing: CoreTiming,
+    ) -> Core<Rc<FakeReader>, Rc<FakeKbm>, Rc<FakeKill>, Rc<FakeClock>> {
         // The core owns clones of the shared handles; tests keep mutating
         // through the originals.
         Core::new(
@@ -413,18 +484,119 @@ mod tests {
             clock.clone(),
             CoreTargets { buyout: BUYOUT, confirm: CONFIRM },
             Key::Escape,
-            // Guard off: existing tests exercise the machine, not the policy.
-            CoreTiming {
-                debounce_ms: 25,
-                watchdog_ms: 10_000,
-                min_actuation_interval_ms: 0,
-                max_actuations_per_min: u32::MAX,
-            },
+            timing,
+            Box::new(ZeroRandom),
         )
     }
 
     fn pressed(kbm: &Rc<FakeKbm>) -> Vec<(i32, i32)> {
         kbm.presses.borrow().clone()
+    }
+
+    /// Always returns 0: exact coordinates, no pause - the default for the
+    /// existing machine tests.
+    struct ZeroRandom;
+
+    impl Random for ZeroRandom {
+        fn below(&mut self, _n: u64) -> u64 {
+            0
+        }
+    }
+
+    /// Cycles 0, 1, 2, ... - deterministic spread for jitter-bound tests.
+    struct Ramp(u64);
+
+    impl Random for Ramp {
+        fn below(&mut self, n: u64) -> u64 {
+            let v = self.0 % n;
+            self.0 += 1;
+            v
+        }
+    }
+
+    /// Drives one full edge -> debounce -> actuation cycle.
+    #[test]
+    fn click_targets_are_jittered_within_the_configured_span() {
+        // Ramp(0): first two draws are 0,1 -> offsets (-3, -2) from a
+        // +-3 px span; Ramp(4): draws 4,5 -> (+1, +2). Deterministic, but
+        // the bounds are what the test pins.
+        for (seed, expected) in
+            [(0u64, (BUYOUT.0 - 3, BUYOUT.1 - 2)), (4, (BUYOUT.0 + 1, BUYOUT.1 + 2))]
+        {
+            let reader = FakeReader::new(Rgb::BLACK, vec![Rgb::RED, Rgb::RED, Rgb::RED]);
+            let kbm = Rc::new(FakeKbm::default());
+            let kill = Rc::new(FakeKill::default());
+            let clock = clock();
+            let mut core = make_core_with_timing(
+                &reader,
+                &kbm,
+                &kill,
+                &clock,
+                CoreTiming {
+                    debounce_ms: 25,
+                    watchdog_ms: 10_000,
+                    min_actuation_interval_ms: 0,
+                    max_actuations_per_min: u32::MAX,
+                    jitter_px: 3,
+                    reaction_min_ms: 0,
+                    reaction_max_ms: 0,
+                },
+            );
+            core.random = Box::new(Ramp(seed));
+
+            assert_eq!(core.step(), StepOutcome::Continue);
+            reader.strobe.set(Rgb::WHITE);
+            clock.t.set(50);
+            assert_eq!(core.step(), StepOutcome::Continue);
+            clock.t.set(100);
+            assert_eq!(core.step(), StepOutcome::Continue);
+
+            let presses = pressed(&kbm);
+            assert_eq!(presses.len(), 1);
+            let (px, py) = presses.first().copied().unwrap_or((0, 0));
+            assert_eq!((px, py), expected);
+            assert!((px - BUYOUT.0).abs() <= 3 && (py - BUYOUT.1).abs() <= 3);
+        }
+    }
+
+    #[test]
+    fn abort_is_never_jittered_or_delayed() {
+        // ABORT takes no reaction pause and no position jitter (it is a
+        // key press): the rng must not be consulted on its path.
+        let reader = FakeReader::new(Rgb::BLACK, vec![Rgb::YELLOW, Rgb::YELLOW, Rgb::YELLOW]);
+        let kbm = Rc::new(FakeKbm::default());
+        let kill = Rc::new(FakeKill::default());
+        let clock = clock();
+        let mut core = make_core_with_timing(
+            &reader,
+            &kbm,
+            &kill,
+            &clock,
+            CoreTiming {
+                debounce_ms: 25,
+                watchdog_ms: 10_000,
+                min_actuation_interval_ms: 0,
+                max_actuations_per_min: u32::MAX,
+                jitter_px: 3,
+                reaction_min_ms: 15,
+                reaction_max_ms: 50,
+            },
+        );
+        // Ramp never being consulted is observable only via behavior here:
+        // an ABORT with the kill... the absence of a pause cannot be timed
+        // deterministically, so pin what is observable - the key is sent
+        // and no press happened.
+        core.random = Box::new(Ramp(0));
+
+        assert_eq!(core.step(), StepOutcome::Continue);
+        reader.strobe.set(Rgb::WHITE);
+        clock.t.set(50);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        clock.t.set(100);
+        assert_eq!(core.step(), StepOutcome::Continue);
+
+        assert_eq!(pressed(&kbm), [] as [(i32, i32); 0]);
+        assert_eq!(kbm.keys.borrow().as_slice(), [Key::Escape]);
     }
 
     fn clock() -> Rc<FakeClock> {
@@ -543,7 +715,11 @@ mod tests {
                 watchdog_ms: 200,
                 min_actuation_interval_ms: 0,
                 max_actuations_per_min: u32::MAX,
+                jitter_px: 0,
+                reaction_min_ms: 0,
+                reaction_max_ms: 0,
             },
+            Box::new(ZeroRandom),
         );
 
         // Seed a black observation so the first white is a real edge.
@@ -760,7 +936,11 @@ mod tests {
                 watchdog_ms: 10_000,
                 min_actuation_interval_ms: 250,
                 max_actuations_per_min: u32::MAX,
+                jitter_px: 0,
+                reaction_min_ms: 0,
+                reaction_max_ms: 0,
             },
+            Box::new(ZeroRandom),
         );
 
         run_cycle(&reader, &kbm, &kill, &clock, &mut core, 0);
@@ -796,7 +976,11 @@ mod tests {
                 watchdog_ms: 10_000,
                 min_actuation_interval_ms: 0,
                 max_actuations_per_min: 2,
+                jitter_px: 0,
+                reaction_min_ms: 0,
+                reaction_max_ms: 0,
             },
+            Box::new(ZeroRandom),
         );
 
         run_cycle(&reader, &kbm, &kill, &clock, &mut core, 100);
@@ -832,7 +1016,11 @@ mod tests {
                 watchdog_ms: 10_000,
                 min_actuation_interval_ms: 250,
                 max_actuations_per_min: u32::MAX,
+                jitter_px: 0,
+                reaction_min_ms: 0,
+                reaction_max_ms: 0,
             },
+            Box::new(ZeroRandom),
         );
 
         // Purchase at t=100...

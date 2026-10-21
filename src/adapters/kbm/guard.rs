@@ -1,8 +1,8 @@
-//! Shared pre-actuation guard for KBM backends (§5.4): window discovery plus
+//! Shared pre-actuation guard for KBM backends: window discovery plus
 //! the foreground policy. `prepared` answers "may this backend actuate now?"
 //! and returns the live window info for client→screen coordinate translation
-//! (§3.7). A `None` means "skip this actuation" - the addon's own stage
-//! timeouts surface it.
+//! against the live game window rect. A `None` means "skip this actuation"
+//! - the addon's own stage timeouts surface it.
 
 use tracing::{
     info,
