@@ -441,12 +441,12 @@ fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
     let mut last_beat = start;
     loop {
         if core.step() == StepOutcome::Exit {
-            // Immediate exit on the kill switch (§3.6): the addon's stage
+            // Immediate exit on the kill switch: the addon's stage
             // timeouts clean up the game state. Distinct exit code so a
             // supervisor sees the emergency stop.
             std::process::exit(EXIT_KILLED);
         }
-        // Soak-test heartbeat (M4): one visibility line per 5 minutes, so a
+        // Soak-test heartbeat: one visibility line per 5 minutes, so a
         // quiet healthy session is distinguishable from a dead terminal.
         if last_beat.elapsed() >= Duration::from_secs(300) {
             let stats = core.stats();
@@ -467,7 +467,7 @@ fn calibrate(cfg: &Config) -> anyhow::Result<()> {
     cfg.validate()?;
     let mut reader = build_reader(cfg);
     info!("calibrate: sampling the four configured points at 1 Hz - Ctrl+C to stop");
-    info!("compare with `/am semaphore status` (idle pixels = #000000)");
+    info!("compare with `/auctimogger semaphore status` (idle pixels = #000000)");
     loop {
         let cmd = reader.read_point((cfg.pixels.cmd.x, cfg.pixels.cmd.y));
         let strobe = reader.read_point((cfg.pixels.strobe.x, cfg.pixels.strobe.y));
@@ -577,7 +577,7 @@ fn doctor_screen(cfg: &Config) -> usize {
                 live_height = h,
                 config_width = s.width,
                 config_height = s.height,
-                "screen: mismatch - re-run `/am semaphore coords` and update sphinx.toml"
+                "screen: mismatch - re-run `/auctimogger semaphore coords` and update sphinx.toml"
             );
             1
         }
@@ -688,7 +688,7 @@ fn doctor_pixels(cfg: &Config) -> usize {
     if strobe == Rgb::WHITE {
         warn!(
             "pixels: strobe is WHITE at rest - a command is committed, or the \
-             points are misaligned; re-check with `/am semaphore coords`"
+             points are misaligned; re-check with `/auctimogger semaphore coords`"
         );
         failures += 1;
     } else if cmd == Rgb::BLACK {
@@ -703,7 +703,7 @@ fn doctor_pixels(cfg: &Config) -> usize {
             cmd = %cmd,
             strobe = %strobe,
             "pixels: non-contract colors - semaphore likely disabled (frames \
-             hidden, game pixels underneath); enable `/am semaphore` to verify \
+             hidden, game pixels underneath); enable `/auctimogger semaphore` to verify \
              exact-color sampling"
         );
     }

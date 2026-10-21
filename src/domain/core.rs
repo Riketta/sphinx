@@ -46,7 +46,7 @@ pub struct CoreTargets {
     pub confirm: (i32, i32),
 }
 
-/// Contract timings (§3.3/§3.4) plus the M4 burst guard, config-driven.
+/// Contract timings (debounce, watchdog) plus the burst guard, config-driven.
 #[derive(Clone, Copy, Debug)]
 pub struct CoreTiming {
     /// The CMD color must hold on two polls at least this far apart.
@@ -61,7 +61,7 @@ pub struct CoreTiming {
     pub max_actuations_per_min: u32,
 }
 
-/// Lifetime counters for the heartbeat log (M4 soak visibility).
+/// Lifetime counters for the heartbeat log (soak-session visibility).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CoreStats {
     /// Actuations performed (presses + ESC keys).
@@ -246,7 +246,7 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
         }
     }
 
-    /// Burst guard (M4): refuses a purchase landing too soon after the
+    /// Burst guard: refuses a purchase landing too soon after the
     /// previous one, or past the rolling per-minute ceiling. The strobe edge
     /// is still consumed (the caller already entered `WaitClear`) - the
     /// addon's own stage timeouts surface the skipped command. Sphinx must

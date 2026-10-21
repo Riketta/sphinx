@@ -1,16 +1,17 @@
 # sphinx
 
 Companion input tool for [AuctiMogger](https://github.com/Riketta/AuctiMogger):
-watches the addon's on-screen pixel semaphore (contract: `../PLAN.md` §3) and
-actuates the native auction-house buy UI with trusted hardware-level input —
-the only kind this fork accepts for purchases.
+watches the addon's on-screen pixel semaphore (wire contract:
+[docs/semaphore.md](docs/semaphore.md)) and actuates the native auction-house
+buy UI with trusted hardware-level input — the only kind this fork accepts
+for purchases.
 
 ```
 CMD pixel    black=idle  red=Buyout  green=Confirm  yellow=ABORT(ESC)
 STROBE pixel black=idle  white=CMD is committed (rising edge = execute)
 ```
 
-Safety behavior (§3.6): exact-color matching only, CMD re-verified right
+Safety behavior: exact-color matching only, CMD re-verified right
 before every actuation, strobe watchdog (white >10s -> idle, never
 re-actuate), one actuation per rising edge, and a polled kill hotkey
 (default `ctrl+alt+f12`, configurable via `kill_hotkey` in `sphinx.toml`)
@@ -38,7 +39,7 @@ while plugging the board in, then from the versa-kbm repo:
 ```sh
 cd crates/vkbm-fw
 cargo run --release          # build + flash + boot the firmware
-cargo run -p vkbm-cli --release -- info   # -> v0.6 switch=on arm=on
+cargo run -p vkbm-cli --release -- info   # -> firmware version, switch/arm state
 ```
 
 Solid blue LED = the device may actuate. A short BOOTSEL tap is the hardware
@@ -46,7 +47,7 @@ kill switch — the host cannot override it.
 
 **2. Install the addon** (details in the AuctiMogger README): symlink or copy
 the `AuctiMogger/` folder into `Interface/AddOns`, then set up your snipe list
-and auto-buy in game (`/am`). When auto-buy hands a deal over, the addon
+and auto-buy in game (`/auctimogger`). When auto-buy hands a deal over, the addon
 signals sphinx through the pixel semaphore — that is what this tool watches.
 
 **3. Configure sphinx.** Copy `sphinx.toml.example` to `sphinx.toml`
@@ -57,7 +58,7 @@ signals sphinx through the pixel semaphore — that is what this tool watches.
 kind = "vkbm"   # the RP2040 board; "sendinput" is the software fallback
 ```
 
-In WoW, run `/am semaphore coords` and paste the printed points into
+In WoW, run `/auctimogger semaphore coords` and paste the printed points into
 `[pixels]` / `[targets]`. Re-do this after any window *resize* (window
 *movement* is fine — points resolve against the live client rect).
 
@@ -74,7 +75,7 @@ strongly) and writes `move-profile.toml`; the closed loop then starts every
 press already calibrated. Re-run it after changing pointer settings.
 Optional spot checks: `cargo run -- press <x> <y>` drives one real guarded
 click (focus WoW first), `cargo run -- calibrate` prints live pixel samples
-to compare with `/am semaphore status`, and `cargo run -- run --dry-run`
+to compare with `/auctimogger semaphore status`, and `cargo run -- run --dry-run`
 rehearses the whole chain without actuating.
 
 **5. Go live:**

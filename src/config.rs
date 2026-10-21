@@ -93,7 +93,7 @@ pub struct Point {
     pub y: i32,
 }
 
-/// Semaphore pixel points, from `/am semaphore coords`. Required: a stale
+/// Semaphore pixel points, from `/auctimogger semaphore coords`. Required: a stale
 /// default would sample the wrong pixels silently.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -104,7 +104,7 @@ pub struct PixelPoints {
     pub strobe: Point,
 }
 
-/// Target button points, from `/am semaphore coords`.
+/// Target button points, from `/auctimogger semaphore coords`.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetPoints {
@@ -247,7 +247,7 @@ impl Default for VkbmBackend {
     }
 }
 
-/// Calibration reference dumped by `/am semaphore coords`; sphinx never
+/// Calibration reference dumped by `/auctimogger semaphore coords`; sphinx never
 /// derives coordinates from it, but `doctor` compares the live desktop.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -313,7 +313,7 @@ impl Config {
         let raw = std::fs::read_to_string(path).with_context(|| {
             format!(
                 "reading {} (copy sphinx.toml.example to sphinx.toml and paste \
-                 `/am semaphore coords` output)",
+                 `/auctimogger semaphore coords` output)",
                 path.display()
             )
         })?;
@@ -429,8 +429,8 @@ impl Config {
         Ok(())
     }
 
-    /// Backend-kind specific validation (§5.4/§8/§11.4): unsupported kinds
-    /// and kinds whose feature/table is missing fail here, at startup.
+    /// Backend-kind specific validation: unsupported kinds and kinds whose
+    /// feature/table is missing fail here, at startup.
     ///
     /// # Errors
     /// Unsupported or unbuildable backend selections.
@@ -438,7 +438,7 @@ impl Config {
         match self.backend.kind {
             BackendKind::Sendinput => {}
             BackendKind::Window => {
-                bail!("backend.kind = \"window\" is planned (PLAN.md 5.4b); use \"sendinput\"")
+                bail!("backend.kind = \"window\" is not implemented; use \"sendinput\"")
             }
             BackendKind::Serial => {
                 #[cfg(not(feature = "serial"))]

@@ -1,6 +1,6 @@
 # sphinx - configuration.
 # Copy to `sphinx.toml` (gitignored) and keep the coordinates in sync with
-# `/am semaphore coords` after any window resize. All points are WoW
+# `/auctimogger semaphore coords` after any window resize. All points are WoW
 # client-area physical pixels (window movement is compensated at use time).
 
 poll_ms = 50           # poll period; contract wants >=20 Hz (<=50 ms)
@@ -12,17 +12,17 @@ watchdog_ms = 10000    # strobe white longer than this -> idle, never re-actuate
 min_actuation_interval_ms = 250 # burst guard: two actuations closer than this = runaway, second refused
 max_actuations_per_min = 30     # burst guard: rolling ceiling; excess actuations are skipped (logged)
 
-# Calibration reference dumped by `/am semaphore coords` (doctor compares the
+# Calibration reference dumped by `/auctimogger semaphore coords` (doctor compares the
 # live desktop against it; sphinx never derives coordinates from these).
 # NOTE: keep these lines ABOVE every [section] - they are top-level keys.
 screen   = { width = 1920, height = 1080 }
 ui_scale = 0.65
 
-[pixels]               # REQUIRED, from `/am semaphore coords` (no defaults)
+[pixels]               # REQUIRED, from `/auctimogger semaphore coords` (no defaults)
 cmd    = { x = 7, y = 7 }
 strobe = { x = 7, y = 15 }
 
-[targets]              # REQUIRED, live button centers from `/am semaphore coords`
+[targets]              # REQUIRED, live button centers from `/auctimogger semaphore coords`
 buyout  = { x = 304, y = 434 }
 confirm = { x = 285, y = 315 }
 

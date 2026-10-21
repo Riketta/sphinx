@@ -1,5 +1,5 @@
 //! Win32 window discovery + process-level helpers shared by the pixel
-//! reader and the KBM backend (§3.7: every configured point resolves
+//! reader and the KBM backend (every configured point resolves
 //! against the live game window rect at use time).
 
 use tracing::warn;
