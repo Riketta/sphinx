@@ -129,20 +129,21 @@ impl Default for AbortKey {
     }
 }
 
-/// Backend selection (§5.4/§5.5).
+/// Backend selection.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Backend {
     /// Which actuator to use.
     #[serde(default)]
     pub kind: BackendKind,
-    /// `window`-backend extras (reserved for §5.4b).
+    /// `window`-backend extras. Window discovery is shared by every backend
+    /// (`process_names` / `title_filter`), regardless of `kind`.
     #[serde(default)]
     pub window: Option<WindowBackend>,
-    /// `serial`-backend extras (reserved for §8).
+    /// `serial`-backend extras.
     #[serde(default)]
     pub serial: Option<SerialBackend>,
-    /// `vkbm`-backend extras (versa-kbm RP2040, §11.4). Everything defaults,
+    /// `vkbm`-backend extras (versa-kbm RP2040). Everything defaults,
     /// so the table itself is optional.
     #[serde(default)]
     pub vkbm: Option<VkbmBackend>,
@@ -155,15 +156,15 @@ pub enum BackendKind {
     /// Hardware-level input via enigo (v1 default).
     #[default]
     Sendinput,
-    /// Window-targeted Win32 messages (§5.4b, planned).
+    /// Window-targeted Win32 messages (planned, not implemented).
     Window,
-    /// UART -> HID dongle / MCU (§8, v2).
+    /// UART -> HID dongle / MCU (behind the `serial` feature).
     Serial,
-    /// versa-kbm RP2040 hardware input over the HID vendor channel (§11.4).
+    /// versa-kbm RP2040 hardware input over the HID vendor channel.
     Vkbm,
 }
 
-/// Window-backend settings (§5.4b).
+/// Window-backend settings.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowBackend {
@@ -177,7 +178,7 @@ pub struct WindowBackend {
     pub title_filter: Option<String>,
 }
 
-/// Serial-backend settings (§8).
+/// Serial-backend settings.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SerialBackend {
@@ -187,7 +188,7 @@ pub struct SerialBackend {
     pub baud: u32,
 }
 
-/// How the vkbm backend places the pointer before a click (§11.3).
+/// How the vkbm backend places the pointer before a click.
 ///
 /// - `relative` (default): closed loop - sphinx reads `GetCursorPos`, sends
 ///   true relative deltas through the board's relative-mouse interface,
@@ -209,7 +210,7 @@ pub enum MoveMode {
     Auto,
 }
 
-/// vkbm-backend settings (§11.4): the versa-kbm RP2040 dongle.
+/// vkbm-backend settings: the versa-kbm RP2040 dongle.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VkbmBackend {
@@ -219,8 +220,10 @@ pub struct VkbmBackend {
     /// USB product id to scan for.
     #[serde(default = "d_vkbm_pid")]
     pub pid: u16,
-    /// Per-attempt ack deadline in ms; a lost ack is resent once (the device
-    /// dedups by sequence number, so the resend cannot execute twice).
+    /// Per-attempt ack deadline in ms; a lost ack is resent once. The device
+    /// dedups the resend only within its 2 s replay window (stamped at
+    /// command completion), so this must stay well under it: a resend that
+    /// lands outside the window would execute as a new command.
     #[serde(default = "d_vkbm_ack_timeout_ms")]
     pub ack_timeout_ms: u64,
     /// Pointer placement strategy (see [`MoveMode`]).
@@ -490,8 +493,11 @@ impl Config {
                 }
                 #[cfg(feature = "vkbm")]
                 if let Some(v) = self.backend.vkbm.as_ref() {
-                    if !(10..=2000).contains(&v.ack_timeout_ms) {
-                        bail!("backend.vkbm.ack_timeout_ms {} outside 10..=2000", v.ack_timeout_ms);
+                    // Half the device's 2 s replay window: the resend fires
+                    // one timeout after the original send, so it must arrive
+                    // while the replay window still covers it.
+                    if !(10..=1000).contains(&v.ack_timeout_ms) {
+                        bail!("backend.vkbm.ack_timeout_ms {} outside 10..=1000", v.ack_timeout_ms);
                     }
                 }
             }
@@ -668,7 +674,7 @@ mod tests {
         .is_err());
         assert!(validated(|cfg| {
             cfg.backend.kind = BackendKind::Vkbm;
-            cfg.backend.vkbm = Some(VkbmBackend { ack_timeout_ms: 2001, ..VkbmBackend::default() });
+            cfg.backend.vkbm = Some(VkbmBackend { ack_timeout_ms: 1001, ..VkbmBackend::default() });
         })
         .is_err());
         assert!(validated(|cfg| {

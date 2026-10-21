@@ -1,4 +1,4 @@
-//! Poll-loop state machine (§5.3). Pure domain: depends only on the ports
+//! Poll-loop state machine. Pure domain: depends only on the ports
 //! plus an injected clock, so every transition is unit-testable with fakes.
 //!
 //! ```text
@@ -64,9 +64,10 @@ pub struct CoreTiming {
 /// Lifetime counters for the heartbeat log (soak-session visibility).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CoreStats {
-    /// Actuations performed (presses + ESC keys).
+    /// Delivered actuations (presses + ESC keys the backend confirmed;
+    /// refused, skipped, or dry-run-echoed attempts are not counted).
     pub actuations: u64,
-    /// ABORT edges served (ESC sent for the error/abort path).
+    /// ABORT taps delivered (ESC confirmed by the backend).
     pub aborts: u64,
     /// Watchdog releases (strobe stuck white / unstable CMD past the limit).
     pub watchdogs: u64,
@@ -77,7 +78,7 @@ pub struct CoreStats {
 pub enum StepOutcome {
     /// Keep polling.
     Continue,
-    /// Kill hotkey pressed: exit the process immediately (§3.6).
+    /// Kill hotkey pressed: exit the process immediately.
     Exit,
 }
 
@@ -150,7 +151,7 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
     }
 
     /// Runs one poll. Never panics on bad input: unknown colors are logged
-    /// and ignored (§5.3 "never panic in the loop" holds by construction).
+    /// and ignored, by construction.
     pub fn step(&mut self) -> StepOutcome {
         if self.kill.kill_requested() {
             info!("kill hotkey down -> exit");
@@ -208,13 +209,13 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
 
     /// Decodes a stable CMD and actuates once. The `WaitClear` state is
     /// already entered by the caller, so a failed decode still swallows the
-    /// strobe until it rests black (one command per rising edge, §3.3 step 5).
+    /// strobe until it rests black (one command per rising edge).
     fn decode_and_execute(&mut self, sample: Rgb, now: u64) {
         let Some(command) = Command::from_rgb(sample) else {
             warn!(color = %sample, "committed CMD is not a known command -> ignored");
             return;
         };
-        // Re-verify immediately before actuation (§3.6): one fresh read.
+        // Re-verify immediately before actuation: one fresh read.
         let verified = self.reader.read_cmd();
         if verified != sample {
             warn!(expected = %sample, read = %verified, "CMD changed before actuation -> ignored");
@@ -226,22 +227,26 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
         if !matches!(command, Command::Abort) && !self.guard_allows(now) {
             return;
         }
-        self.stats.actuations += 1;
         match command {
             Command::Buyout => {
                 let (x, y) = self.targets.buyout;
                 info!(x, y, "BUYOUT: pressing native Buyout button");
-                self.kbm.press(x, y);
+                if self.kbm.press(x, y) {
+                    self.stats.actuations += 1;
+                }
             }
             Command::Confirm => {
                 let (x, y) = self.targets.confirm;
                 info!(x, y, "CONFIRM: pressing Buy Now");
-                self.kbm.press(x, y);
+                if self.kbm.press(x, y) {
+                    self.stats.actuations += 1;
+                }
             }
             Command::Abort => {
-                self.stats.aborts += 1;
                 info!(key = ?self.abort_key, "ABORT: one key per edge");
-                self.kbm.key(self.abort_key);
+                if self.kbm.key(self.abort_key) {
+                    self.stats.aborts += 1;
+                }
             }
         }
     }
@@ -354,12 +359,14 @@ mod tests {
     }
 
     impl Kbm for Rc<FakeKbm> {
-        fn press(&mut self, x: i32, y: i32) {
+        fn press(&mut self, x: i32, y: i32) -> bool {
             self.presses.borrow_mut().push((x, y));
+            true
         }
 
-        fn key(&mut self, key: Key) {
+        fn key(&mut self, key: Key) -> bool {
             self.keys.borrow_mut().push(key);
+            true
         }
 
         fn cursor(&self) -> (i32, i32) {
@@ -870,7 +877,8 @@ mod tests {
         clock.t.set(100 + 10_000 + 50);
         assert_eq!(core.step(), StepOutcome::Continue);
 
-        // ...then an ABORT hand-off runs (actuation 2, abort 1).
+        // ...then an ABORT hand-off runs (abort 1; ESC counts as an abort,
+        // not as a press actuation).
         reader.strobe.set(Rgb::BLACK);
         clock.t.set(10_200);
         assert_eq!(core.step(), StepOutcome::Continue);
@@ -881,7 +889,7 @@ mod tests {
         assert_eq!(core.step(), StepOutcome::Continue);
 
         let stats = core.stats();
-        assert_eq!(stats.actuations, 2);
+        assert_eq!(stats.actuations, 1);
         assert_eq!(stats.aborts, 1);
         assert_eq!(stats.watchdogs, 1);
     }

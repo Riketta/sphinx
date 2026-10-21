@@ -132,13 +132,14 @@ enum AnyKbm {
 }
 
 impl Kbm for AnyKbm {
-    fn press(&mut self, x: i32, y: i32) {
+    fn press(&mut self, x: i32, y: i32) -> bool {
         match self {
             Self::Live(kbm) => kbm.press(x, y),
             Self::Dry { require_foreground, game } => {
                 if dry_note(*require_foreground, game, "press") {
                     info!("[dry-run] would press ({x}, {y})");
                 }
+                false
             }
             #[cfg(feature = "serial")]
             Self::Serial(kbm) => kbm.press(x, y),
@@ -147,13 +148,14 @@ impl Kbm for AnyKbm {
         }
     }
 
-    fn key(&mut self, key: Key) {
+    fn key(&mut self, key: Key) -> bool {
         match self {
             Self::Live(kbm) => kbm.key(key),
             Self::Dry { require_foreground, game } => {
                 if dry_note(*require_foreground, game, "key") {
                     info!("[dry-run] would send {key:?}");
                 }
+                false
             }
             #[cfg(feature = "serial")]
             Self::Serial(kbm) => kbm.key(key),
@@ -551,9 +553,9 @@ fn doctor(cfg: &Config, smoke: bool) -> anyhow::Result<()> {
         // the configured move mode) runs on every doctor pass, not only
         // under --smoke: a board that cannot serve the configured mode is
         // an environment failure, not a bench extra.
-        failures += doctor_vkbm_link(cfg, smoke)?;
+        failures += doctor_vkbm_link(cfg, smoke);
     }
-    failures += doctor_smoke(cfg, smoke)?;
+    failures += doctor_smoke(cfg, smoke);
 
     if failures > 0 {
         bail!("doctor: {failures} check(s) failed");
@@ -842,7 +844,7 @@ fn doctor_serial_placement(cfg: &Config) -> usize {
 /// relative pointer on firmware older than 0.5. With `smoke`, additionally
 /// runs the dry-run echo round-trip (nothing actuates).
 #[cfg(feature = "vkbm")]
-fn doctor_vkbm_link(cfg: &Config, smoke: bool) -> anyhow::Result<usize> {
+fn doctor_vkbm_link(cfg: &Config, smoke: bool) -> usize {
     let vkbm = cfg.backend.vkbm.clone().unwrap_or_default();
     let mut kbm = match VkbmKbm::new(
         vkbm.vid,
@@ -857,52 +859,67 @@ fn doctor_vkbm_link(cfg: &Config, smoke: bool) -> anyhow::Result<usize> {
         Ok(kbm) => kbm,
         Err(e) => {
             warn!(error = %e, "vkbm link: handshake failed");
-            return Ok(1);
+            return 1;
         }
     };
     if smoke {
-        kbm.smoke_echo().context("smoke: vkbm dry-run echo failed")?;
-        info!("smoke: vkbm link verified (handshake + dry-run echo)");
+        match kbm.smoke_echo() {
+            Ok(()) => info!("smoke: vkbm link verified (handshake + dry-run echo)"),
+            Err(e) => {
+                warn!(error = %e, "smoke: vkbm dry-run echo failed");
+                return 1;
+            }
+        }
     }
-    Ok(0)
+    0
 }
 
 /// Returns 1 when the smoke test was requested and failed.
-fn doctor_smoke(cfg: &Config, smoke: bool) -> anyhow::Result<usize> {
+fn doctor_smoke(cfg: &Config, smoke: bool) -> usize {
     if !smoke {
-        return Ok(0);
+        return 0;
     }
     if cfg.backend.kind == BackendKind::Serial {
         // A serial build's smoke test is the link handshake itself: opening
         // the port pings the MCU, which must ack.
         #[cfg(feature = "serial")]
         {
-            let serial = cfg.backend.serial.as_ref().context("backend.serial missing")?;
-            SerialKbm::new(
+            let Some(serial) = cfg.backend.serial.as_ref() else {
+                warn!("smoke: backend.serial missing (validate should have refused)");
+                return 1;
+            };
+            if let Err(e) = SerialKbm::new(
                 &serial.port,
                 serial.baud,
                 cfg.require_foreground,
                 cfg.focus_if_needed,
                 GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref()),
-            )
-            .context("smoke: serial link ping failed")?;
+            ) {
+                warn!(error = %e, "smoke: serial link ping failed");
+                return 1;
+            }
             info!("smoke: serial link ping acked");
-            return Ok(0);
+            return 0;
         }
         #[cfg(not(feature = "serial"))]
-        return Ok(0); // validate() already refused this combination
+        return 0; // validate() already refused this combination
     }
     if cfg.backend.kind == BackendKind::Vkbm {
         // The vkbm link check (handshake + capability gate) is doctoring's
         // always-on `doctor_vkbm_link`; the dry-run echo rides `smoke`.
-        return Ok(0);
+        return 0;
     }
-    let mut kbm = SendInputKbm::new(
+    let mut kbm = match SendInputKbm::new(
         false,
         false,
         GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref()),
-    )
-    .context("enigo init failed")?;
+    ) {
+        Ok(kbm) => kbm,
+        Err(e) => {
+            warn!(error = %e, "smoke: enigo init failed");
+            return 1;
+        }
+    };
     let before = kbm.cursor();
     match kbm.smoke_move() {
         Ok(()) => info!(
@@ -914,8 +931,8 @@ fn doctor_smoke(cfg: &Config, smoke: bool) -> anyhow::Result<usize> {
         ),
         Err(e) => {
             warn!(error = %e, "smoke: pointer move failed");
-            return Ok(1);
+            return 1;
         }
     }
-    Ok(0)
+    0
 }

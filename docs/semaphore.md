@@ -46,8 +46,13 @@ above game UI), `EnableMouse(false)` (input-transparent), anchored to
 
 ## Timing
 
-- Reader poll period: ≤50 ms (≥20 Hz). Actuation latency budget: ≤150 ms
-  after the rising edge.
+- Reader poll period: ≤50 ms (≥20 Hz). Actuation latency budget after the
+  rising edge: ≤150 ms on the direct absolute paths (the software
+  `sendinput` backend, the board's absolute mode, and the UART backend's
+  ~160 ms worst case); the default closed-loop **relative** path is allowed
+  up to ~2 s to converge from any distance and **refuses to click** when it
+  cannot verify the landing. The writer's 5 s per-stage timeout absorbs
+  either.
 - Writer per-stage ack timeout: 5 s (waiting for the game-event ack). On a
   BUYOUT-stage timeout: ABORT and re-actuate once within the same hand-off
   (the scan hold keeps the screen stable); the 10 s hand-off budget then

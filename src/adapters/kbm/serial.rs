@@ -132,7 +132,6 @@ impl LineLink for SerialLink {
         // bytes * port_timeout.
         let deadline = Instant::now() + ACK_TIMEOUT;
         let mut line = AckLine::new();
-        let mut byte = [0u8; 1];
         loop {
             if Instant::now() > deadline {
                 return Err(io::Error::new(
@@ -140,25 +139,40 @@ impl LineLink for SerialLink {
                     "serial ack deadline exceeded",
                 ));
             }
-            self.port.read_exact(&mut byte)?;
-            let completed = match line.push(byte[0]) {
-                Ok(completed) => completed,
-                Err(AckLineError::TooLong) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "serial ack line too long",
-                    ));
+            // `read`, not `read_exact`: a serialport timeout surfaces as
+            // Ok(0) on some platforms and Err(TimedOut) on others, and
+            // read_exact would turn the Ok(0) form into a fatal
+            // UnexpectedEof that `issue` refuses to retry. Both forms mean
+            // "no byte yet" here; the deadline bounds the loop.
+            let mut byte = [0u8; 1];
+            match self.port.read(&mut byte) {
+                Ok(n) if n > 0 => {
+                    let completed = match line.push(byte[0]) {
+                        Ok(completed) => completed,
+                        Err(AckLineError::TooLong) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "serial ack line too long",
+                            ));
+                        }
+                    };
+                    if let Some(text) = completed {
+                        return if is_ok_line(text) {
+                            Ok(())
+                        } else {
+                            Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "unexpected serial ack {:?}",
+                                    String::from_utf8_lossy(text)
+                                ),
+                            ))
+                        };
+                    }
                 }
-            };
-            if let Some(text) = completed {
-                return if is_ok_line(text) {
-                    Ok(())
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unexpected serial ack {:?}", String::from_utf8_lossy(text)),
-                    ))
-                };
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {}
+                Err(e) => return Err(e),
             }
         }
     }
@@ -246,14 +260,14 @@ impl SerialKbm {
 }
 
 impl Kbm for SerialKbm {
-    fn press(&mut self, x: i32, y: i32) {
+    fn press(&mut self, x: i32, y: i32) -> bool {
         let Some((sx, sy)) = self.guard.prepared_point("serial press", x, y) else {
-            return;
+            return false;
         };
         // Same TOCTOU re-check as the sendinput backend: the click must not
         // land in whatever window took focus between check and send.
         if !self.guard.still_prepared("serial press") {
-            return;
+            return false;
         }
         // The MCU's absolute HID report is normalized across the primary
         // display only, exactly like the vkbm absolute fast path - a target
@@ -266,22 +280,22 @@ impl Kbm for SerialKbm {
                 "target outside the primary monitor - the serial backend's absolute reports \
                  cannot reach it; skipping (make WoW the primary display)"
             );
-            return;
+            return false;
         }
-        let _ = issue_once(&mut self.link, &format!("C {sx} {sy}\n"));
+        issue_once(&mut self.link, &format!("C {sx} {sy}\n")).is_ok()
     }
 
-    fn key(&mut self, key: Key) {
+    fn key(&mut self, key: Key) -> bool {
         if !self.guard.prepared_key("serial key") {
-            return;
+            return false;
         }
         if !self.guard.still_prepared("serial key") {
-            return;
+            return false;
         }
         let code = match key {
             Key::Escape => i32::from(VK_ESCAPE),
         };
-        let _ = issue_once(&mut self.link, &format!("K {code}\n"));
+        issue_once(&mut self.link, &format!("K {code}\n")).is_ok()
     }
 
     fn cursor(&self) -> (i32, i32) {

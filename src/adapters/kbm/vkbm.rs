@@ -1110,35 +1110,37 @@ impl VkbmKbm {
 }
 
 impl Kbm for VkbmKbm {
-    fn press(&mut self, x: i32, y: i32) {
+    fn press(&mut self, x: i32, y: i32) -> bool {
         let Some((sx, sy)) = self.guard.prepared_point("vkbm press", x, y) else {
-            return;
+            return false;
         };
         // Same TOCTOU re-check as the other backends: the click must not
         // land in whatever window took focus between check and send.
         if !self.guard.still_prepared("vkbm press") {
-            return;
+            return false;
         }
         let (w, h) = screen_size();
         if wants_relative(self.move_mode, (sx, sy), (w, h)) {
-            self.press_relative(sx, sy);
+            self.press_relative(sx, sy)
         } else {
-            self.press_abs(x, y, sx, sy, w, h);
+            self.press_abs(x, y, sx, sy, w, h)
         }
     }
 
-    fn key(&mut self, key: Key) {
+    fn key(&mut self, key: Key) -> bool {
         if !self.guard.prepared_key("vkbm key") {
-            return;
+            return false;
         }
         if !self.guard.still_prepared("vkbm key") {
-            return;
+            return false;
         }
         let cmd = match key {
             Key::Escape => wire::Cmd::KeyTap { usage: USAGE_ESCAPE },
         };
         let outcome = self.client.request(cmd, self.timeout);
+        let delivered = matches!(&outcome, Ok(wire::Reply::Ok));
         report_actuation("key", cmd, outcome);
+        delivered
     }
 
     fn cursor(&self) -> (i32, i32) {
@@ -1151,7 +1153,7 @@ impl VkbmKbm {
     /// (Windows normalizes absolute HID mice across the primary only), so a
     /// target outside it is skipped rather than clamped into some other
     /// window; `doctor` reports the placement problem.
-    fn press_abs(&mut self, x: i32, y: i32, sx: i32, sy: i32, w: i32, h: i32) {
+    fn press_abs(&mut self, x: i32, y: i32, sx: i32, sy: i32, w: i32, h: i32) -> bool {
         if !point_in_primary((sx, sy), (w, h)) {
             warn!(
                 action = "press",
@@ -1160,22 +1162,25 @@ impl VkbmKbm {
                 "target outside the primary monitor - move_mode = \"abs\" cannot reach it; \
                  skipping (set move_mode = \"relative\"/\"auto\" or make WoW the primary display)"
             );
-            return;
+            return false;
         }
         let cmd = wire::Cmd::ClickAbs { x: to_abs(sx, w), y: to_abs(sy, h) };
         let outcome = self.client.request(cmd, self.timeout);
-        let acked = matches!(&outcome, Ok(wire::Reply::Ok | wire::Reply::Echo));
+        // The echo means the device did NOT click (dry-run): claiming it
+        // would poison soak stats.
+        let delivered = matches!(&outcome, Ok(wire::Reply::Ok));
         report_actuation("press", cmd, outcome);
-        if acked {
+        if delivered {
             info!(client_x = x, client_y = y, screen_x = sx, screen_y = sy, "press sent (abs)");
         }
+        delivered
     }
 
     /// The closed-loop path (§11.3): converge the OS cursor onto the target
     /// with true relative reports, then click through the same pointer.
     /// Works on every monitor; costs a few round-trips instead of one
     /// report, and refuses to click when the move did not verify.
-    fn press_relative(&mut self, sx: i32, sy: i32) {
+    fn press_relative(&mut self, sx: i32, sy: i32) -> bool {
         // Anchor the press routing to the relative pointer before anything
         // else: a zero delta emits no report but flips the device's "pointer
         // that moved last", so the click can never ride the absolute pointer
@@ -1186,7 +1191,7 @@ impl VkbmKbm {
         let routed = matches!(&outcome, Ok(wire::Reply::Ok | wire::Reply::Echo));
         report_actuation("press", route, outcome);
         if !routed {
-            return;
+            return false;
         }
         let (landed, nudges) = {
             let mut pointer = OsRelPointer { client: &mut self.client, timeout: self.timeout };
@@ -1202,7 +1207,7 @@ impl VkbmKbm {
                         "relative move did not converge; skipping (never click at an unverified \
                          position)"
                     );
-                    return;
+                    return false;
                 }
                 Err(e) => {
                     warn!(
@@ -1213,28 +1218,52 @@ impl VkbmKbm {
                         "relative move did not converge; skipping (never click at an unverified \
                          position)"
                     );
-                    return;
+                    return false;
                 }
             }
         };
         // The move took tens of ms; re-check the foreground policy before
         // the click lands (same TOCTOU as everywhere else).
         if !self.guard.still_prepared("vkbm press") {
-            return;
+            return false;
         }
-        let down_executed = self.press_button(true);
-        if down_executed {
+        // A physical mouse bump in the last milliseconds would click at the
+        // disturbed position: re-read the real cursor against the verified
+        // landing (the converge loop's tolerance).
+        let (cur_x, cur_y) = read_cursor();
+        if (cur_x - landed.0).abs() > CONVERGE_TOLERANCE_PX
+            || (cur_y - landed.1).abs() > CONVERGE_TOLERANCE_PX
+        {
+            warn!(
+                action = "press",
+                screen_x = sx,
+                screen_y = sy,
+                landed_x = landed.0,
+                landed_y = landed.1,
+                cursor_x = cur_x,
+                cursor_y = cur_y,
+                "cursor moved after converge; skipping (never click at an unverified position)"
+            );
+            return false;
+        }
+        let down = self.press_half(true);
+        if matches!(down, HalfOutcome::Executed) {
             thread::sleep(CLICK_HOLD);
         }
-        let up_executed = self.press_button(false);
-        if down_executed && !up_executed {
-            // The down may have landed with the up lost: the button can be
-            // latched, so release everything as best-effort recovery
-            // (release-class on the device, always allowed).
+        let up = self.press_half(false);
+        // Recovery: whenever the button may be latched - the down landed but
+        // the up failed, or either ack was lost (state unknown) - sweep
+        // everything released (release-class on the device, always allowed).
+        // A refused or echoed down pressed nothing, so no sweep is needed.
+        let maybe_latched = matches!(down, HalfOutcome::Executed | HalfOutcome::Lost)
+            && !matches!(up, HalfOutcome::Executed);
+        if maybe_latched {
             let outcome = self.client.request(wire::Cmd::ReleaseAll, self.timeout);
             report_actuation("press", wire::Cmd::ReleaseAll, outcome);
         }
-        if down_executed && up_executed {
+        let delivered =
+            matches!(down, HalfOutcome::Executed) && matches!(up, HalfOutcome::Executed);
+        if delivered {
             info!(
                 screen_x = sx,
                 screen_y = sy,
@@ -1244,39 +1273,53 @@ impl VkbmKbm {
                 "press sent (relative)"
             );
         }
+        delivered
     }
 
-    /// One half of a relative-mode click. The up is attempted even after a
-    /// lost down: a release is always safe (release-class on the device)
-    /// and unlatches the button whether or not the down landed. Returns
-    /// whether the button physically changed state (dry-run echoes count
-    /// as "not actuated" and are logged as such).
-    fn press_button(&mut self, down: bool) -> bool {
+    /// One half of a relative-mode click, classified for the recovery and
+    /// delivery decisions: a lost ack leaves the button state unknown
+    /// (possibly latched), a refusal leaves it untouched, an echo means the
+    /// device is in dry-run. The up is attempted even after a lost down: a
+    /// release is always safe (release-class on the device) and unlatches
+    /// the button whether or not the down landed.
+    fn press_half(&mut self, down: bool) -> HalfOutcome {
         let cmd = if down { wire::Cmd::MouseDown } else { wire::Cmd::MouseUp };
         match self.client.request(cmd, self.timeout) {
-            Ok(wire::Reply::Ok) => true,
+            Ok(wire::Reply::Ok) => HalfOutcome::Executed,
             Ok(wire::Reply::Echo) => {
                 warn!(action = "press", command = %cmd, "vkbm dry-run echo (not actuated)");
-                false
+                HalfOutcome::Echo
             }
             Ok(wire::Reply::Err(code)) => {
                 warn!(action = "press", command = %cmd, "vkbm refused: {code}");
-                false
+                HalfOutcome::Refused
             }
             Ok(other) => {
                 warn!(action = "press", command = %cmd, "vkbm unexpected reply {other:?}");
-                false
+                HalfOutcome::Refused
             }
             Err(RequestError::Lost) => {
                 warn!(action = "press", command = %cmd, "vkbm ack lost - button state unknown");
-                false
+                HalfOutcome::Lost
             }
             Err(RequestError::Link(e)) => {
                 warn!(action = "press", command = %cmd, "vkbm transport failed: {e}");
-                false
+                HalfOutcome::Lost
             }
         }
     }
+}
+
+/// Outcome of one click half (see [`VkbmKbm::press_half`]).
+enum HalfOutcome {
+    /// The device acked the physical state change.
+    Executed,
+    /// Dry-run: the device echoed instead of actuating.
+    Echo,
+    /// The device refused (gate/payload) - nothing was pressed.
+    Refused,
+    /// No ack: the state change may or may not have landed.
+    Lost,
 }
 
 /// Current OS cursor position in screen coordinates.
@@ -1637,6 +1680,21 @@ mod tests {
         assert_eq!(out[1], 0x23);
         assert_eq!(out[2], wire::BUTTON_LEFT);
         assert!(out[3..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn encodes_keytap_and_release_all() {
+        let mut buf = [0u8; 64];
+        wire::encode(wire::Cmd::KeyTap { usage: 0x2C }, 7, &mut buf);
+        assert_eq!(buf[0], 7);
+        assert_eq!(buf[1], 0x12, "key-tap tag");
+        assert_eq!(buf[2], 0x2C, "usage byte");
+        assert!(buf[3..].iter().all(|&b| b == 0));
+
+        wire::encode(wire::Cmd::ReleaseAll, 9, &mut buf);
+        assert_eq!(buf[0], 9);
+        assert_eq!(buf[1], 0x30, "release-all tag");
+        assert!(buf[2..].iter().all(|&b| b == 0));
     }
 
     #[test]

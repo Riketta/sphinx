@@ -1,6 +1,6 @@
 //! Inbound adapter: samples the semaphore pixels via `GetPixel` on the
 //! screen DC, resolving configured client points against the live game
-//! window rect (§3.7).
+//! window rect.
 
 use std::time::{
     Duration,
@@ -37,6 +37,11 @@ const REFRESH_AFTER: Duration = Duration::from_secs(2);
 /// process snapshot + `EnumWindows` scan is too costly for 20 Hz polling).
 const RETRY_FIND_AFTER: Duration = Duration::from_millis(250);
 
+/// How long one identical warning stays suppressed: two configured points
+/// failing with *different* messages would otherwise alternate at poll rate
+/// (a simple last-message dedup floods in that case).
+const WARN_REPEAT: Duration = Duration::from_secs(30);
+
 /// Screen DC held for the reader's lifetime; per-sample `GetDC`/`ReleaseDC`
 /// was pure churn at 20 Hz.
 struct ScreenDc(HDC);
@@ -72,7 +77,7 @@ pub struct PixelReader {
     refreshed_at: Option<Instant>,
     last_find_attempt: Option<Instant>,
     screen_dc: Option<ScreenDc>,
-    last_warn: Option<&'static str>,
+    warn_stamps: Vec<(&'static str, Instant)>,
 }
 
 impl PixelReader {
@@ -86,7 +91,7 @@ impl PixelReader {
             refreshed_at: None,
             last_find_attempt: None,
             screen_dc: None,
-            last_warn: None,
+            warn_stamps: Vec::new(),
         }
     }
 
@@ -128,7 +133,6 @@ impl PixelReader {
             self.warn_limited("GetPixel failed (point outside the screen?); pixel read as idle");
             return Rgb::BLACK;
         }
-        self.last_warn = None;
         let c = colorref.0;
         #[allow(clippy::cast_possible_truncation)] // each channel is masked to 8 bits
         Rgb::new((c & 0xFF) as u8, ((c >> 8) & 0xFF) as u8, ((c >> 16) & 0xFF) as u8)
@@ -158,10 +162,25 @@ impl PixelReader {
         }
     }
 
+    /// Decides whether `msg` should warn now: once per message per
+    /// [`WARN_REPEAT`], so alternating failures cannot flood the log at
+    /// poll rate.
+    fn should_warn(&mut self, msg: &'static str) -> bool {
+        let now = Instant::now();
+        if let Some((_, at)) = self.warn_stamps.iter_mut().find(|(m, _)| *m == msg) {
+            if now.duration_since(*at) < WARN_REPEAT {
+                return false;
+            }
+            *at = now;
+        } else {
+            self.warn_stamps.push((msg, now));
+        }
+        true
+    }
+
     fn warn_limited(&mut self, msg: &'static str) {
-        if self.last_warn != Some(msg) {
+        if self.should_warn(msg) {
             warn!("{msg}");
-            self.last_warn = Some(msg);
         }
     }
 }
@@ -173,5 +192,21 @@ impl SemaphoreReader for PixelReader {
 
     fn read_strobe(&mut self) -> Rgb {
         self.read_point(self.strobe)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alternating_failures_do_not_flood() {
+        let mut reader = PixelReader::new(GameWindow::new(&[], None), (0, 0), (0, 0));
+        assert!(reader.should_warn("cmd failed"));
+        assert!(reader.should_warn("strobe failed"));
+        // The same two messages alternating must be suppressed inside the
+        // window: the old last-message-identity dedup emitted at poll rate.
+        assert!(!reader.should_warn("cmd failed"));
+        assert!(!reader.should_warn("strobe failed"));
     }
 }
