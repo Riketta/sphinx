@@ -89,6 +89,10 @@ fn d_escape() -> String {
     "escape".to_string()
 }
 
+fn d_space() -> String {
+    "space".to_string()
+}
+
 fn d_process_names() -> Vec<String> {
     DEFAULT_PROCESS_NAMES.iter().map(|s| (*s).to_string()).collect()
 }
@@ -157,6 +161,26 @@ impl Default for AbortKey {
         Self { key: d_escape() }
     }
 }
+
+/// Anti-AFK actuation key settings: the key sphinx taps on the addon's AFK
+/// semaphore signal (bind the key in `WoW` to a spell/buff or jump).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AfkKey {
+    /// Key name sphinx taps (shared key-name table; modifiers and ESC are
+    /// rejected at validation).
+    #[serde(default = "d_space")]
+    pub key: String,
+}
+
+impl Default for AfkKey {
+    fn default() -> Self {
+        Self { key: d_space() }
+    }
+}
+
+/// Key names rejected for the anti-AFK tap: a lone modifier does nothing.
+const AFK_REJECTED: [&str; 7] = ["ctrl", "control", "alt", "menu", "shift", "win", "super"];
 
 /// Backend selection.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -345,6 +369,9 @@ pub struct Config {
     /// ABORT key settings.
     #[serde(default)]
     pub abort_key: AbortKey,
+    /// Anti-AFK key settings.
+    #[serde(default)]
+    pub afk_key: AfkKey,
     /// Actuator backend.
     #[serde(default)]
     pub backend: Backend,
@@ -486,6 +513,18 @@ impl Config {
             None => bail!("abort_key.key {:?} is not a known key name", self.abort_key.key),
             Some(vk) if vk == VK_ESCAPE => {}
             Some(_) => bail!("abort_key: v1 supports only \"escape\""),
+        }
+        // The anti-AFK tap must be a real keybind key: modifiers alone do
+        // nothing, and ESC belongs to the ABORT path (an idle ESC could close
+        // the auction house mid-session).
+        let afk_name = self.afk_key.key.to_lowercase();
+        if AFK_REJECTED.contains(&afk_name.as_str()) {
+            bail!("afk_key.key {:?} is a lone modifier - bind a real key", self.afk_key.key);
+        }
+        match key_code(&afk_name) {
+            None => bail!("afk_key.key {:?} is not a known key name", self.afk_key.key),
+            Some(VK_ESCAPE) => bail!("afk_key.key \"escape\" is reserved for ABORT"),
+            Some(_) => {}
         }
         // An empty list would silently disable window discovery forever.
         if self.process_names().is_empty() {
@@ -697,6 +736,22 @@ mod tests {
         assert!(validated(|cfg| cfg.abort_key.key = "nope".to_string()).is_err());
         // ...and wrongly cased must still work.
         assert!(validated(|cfg| cfg.abort_key.key = "Escape".to_string()).is_ok());
+    }
+
+    #[test]
+    fn afk_key_defaults_to_space_and_rejects_useless_keys() -> Result<(), String> {
+        assert_eq!(parse(VALID)?.afk_key.key, "space");
+        // Spell/buff keybinds: any known non-modifier, non-ESC key name.
+        assert!(validated(|cfg| cfg.afk_key.key = "f5".to_string()).is_ok());
+        assert!(validated(|cfg| cfg.afk_key.key = "q".to_string()).is_ok());
+        assert!(validated(|cfg| cfg.afk_key.key = "Space".to_string()).is_ok());
+        // A lone modifier taps nothing...
+        assert!(validated(|cfg| cfg.afk_key.key = "shift".to_string()).is_err());
+        // ESC is the ABORT path's key...
+        assert!(validated(|cfg| cfg.afk_key.key = "escape".to_string()).is_err());
+        // ...and unknown names fail fast.
+        assert!(validated(|cfg| cfg.afk_key.key = "nope".to_string()).is_err());
+        Ok(())
     }
 
     #[test]

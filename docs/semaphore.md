@@ -25,6 +25,7 @@ above game UI), `EnableMouse(false)` (input-transparent), anchored to
 | CMD    | `#FF0000` | BUYOUT — actuate the native Buyout button            |
 | CMD    | `#00FF00` | CONFIRM — actuate the buy dialog's Buy Now button    |
 | CMD    | `#FFFF00` | ABORT — press ESC; stop everything                   |
+| CMD    | `#FF00FF` | AFK — tap the configured anti-AFK key once           |
 | STROBE | `#000000` | idle                                                 |
 | STROBE | `#FFFFFF` | the current CMD is committed (rising edge = execute) |
 
@@ -67,6 +68,14 @@ above game UI), `EnableMouse(false)` (input-transparent), anchored to
   clear. The ABORT display self-resets after 2 s (markers idle), and the
   writer's release path defers its clear so the yellow edge is never
   truncated to zero frames.
+- AFK (magenta) is the optional anti-AFK idle reset: the writer signals it
+  only during a live session with nothing in flight, on a randomized 5–10
+  min cadence (addon-owned timing). The reader taps the configured key
+  (`[afk_key]` in `sphinx.toml`; default `space` — bind it in WoW to a
+  spell/buff or jump) once per rising edge, exempt from the burst guard,
+  with no reaction pause or jitter (nothing is clicked). The display
+  self-resets after 2 s like ABORT. The pulse resets the game's idle timer
+  without touching the pointer or the purchase flow.
 
 ## Writer-side guarantees
 

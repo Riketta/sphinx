@@ -165,6 +165,8 @@ impl Kbm for SendInputKbm {
         }
         let enigo_key = match key {
             Key::Escape => enigo::Key::Escape,
+            // `Key::Other` resolves to a raw VIRTUAL_KEY on Windows.
+            Key::Vk(vk) => enigo::Key::Other(u32::from(vk)),
         };
         if let Err(e) = self.enigo.key(enigo_key, Direction::Click) {
             warn!(error = %e, "key press failed");

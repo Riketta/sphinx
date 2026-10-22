@@ -294,6 +294,7 @@ impl Kbm for SerialKbm {
         }
         let code = match key {
             Key::Escape => i32::from(VK_ESCAPE),
+            Key::Vk(vk) => i32::from(vk),
         };
         issue_once(&mut self.link, &format!("K {code}\n")).is_ok()
     }

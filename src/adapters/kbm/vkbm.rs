@@ -96,6 +96,34 @@ const VENDOR_USAGE: u16 = 0x01;
 /// HID keyboard usage for ESC (what [`Key::Escape`] maps to on the wire).
 const USAGE_ESCAPE: u8 = 0x29;
 
+/// Windows virtual-key -> HID keyboard usage for the vocabulary the shared
+/// key-name table supports (letters, digits, F1-F24, navigation, locks,
+/// space). `None` for anything else - the anti-AFK config validation rejects
+/// unknown names anyway, so a `None` here means a coding bug, not config.
+fn usage_for_vk(vk: u8) -> Option<u8> {
+    match vk {
+        0x08 => Some(0x2A),                    // backspace
+        0x09 => Some(0x2B),                    // tab
+        0x0D => Some(0x28),                    // enter
+        0x14 => Some(0x39),                    // capslock
+        0x1B => Some(0x29),                    // escape
+        0x20 => Some(0x2C),                    // space
+        0x21 => Some(0x4B),                    // pageup
+        0x22 => Some(0x4E),                    // pagedown
+        0x23 => Some(0x4D),                    // end
+        0x24 => Some(0x4A),                    // home
+        0x2D => Some(0x49),                    // insert
+        0x2E => Some(0x4C),                    // delete
+        0x30..=0x39 => Some(vk - 0x30 + 0x1E), // 0-9
+        0x41..=0x5A => Some(vk - 0x41 + 0x04), // a-z
+        0x70..=0x7B => Some(vk - 0x70 + 0x3A), // f1-f12
+        0x7C..=0x87 => Some(vk - 0x7C + 0x68), // f13-f24
+        0x90 => Some(0x53),                    // numlock
+        0x91 => Some(0x47),                    // scrolllock
+        _ => None,
+    }
+}
+
 /// Protocol major this backend speaks; `new` refuses anything else.
 const PROTOCOL_MAJOR: u8 = 0;
 
@@ -1149,6 +1177,15 @@ impl Kbm for VkbmKbm {
         }
         let cmd = match key {
             Key::Escape => wire::Cmd::KeyTap { usage: USAGE_ESCAPE },
+            Key::Vk(vk) => wire::Cmd::KeyTap {
+                usage: usage_for_vk(vk).unwrap_or_else(|| {
+                    // Config validation only permits keys with a known HID
+                    // usage; a stray code here degrades to a no-op tap the
+                    // firmware ignores (usage 0 = reserved/none).
+                    warn!(vk, "no HID usage for virtual key; sending none");
+                    0
+                }),
+            },
         };
         let outcome = self.client.request(cmd, self.timeout);
         let delivered = matches!(&outcome, Ok(wire::Reply::Ok));
@@ -1604,6 +1641,7 @@ mod tests {
         step_axis,
         sweep_dir,
         to_abs,
+        usage_for_vk,
         wait_ack,
         wants_relative,
         wire,
@@ -2309,5 +2347,23 @@ mod tests {
         assert_eq!(scale_axis(1, 3.0), 0, "sub-half corrections round to zero");
         assert_eq!(scale_axis(99_999, 1.0), i16::MAX);
         assert_eq!(scale_axis(-99_999, 1.0), i16::MIN);
+    }
+
+    #[test]
+    fn usage_for_vk_covers_the_key_name_vocabulary() {
+        // Letters and digits are contiguous HID runs.
+        assert_eq!(usage_for_vk(0x41), Some(0x04)); // a
+        assert_eq!(usage_for_vk(0x5A), Some(0x1D)); // z
+        assert_eq!(usage_for_vk(0x30), Some(0x1E)); // 0
+        assert_eq!(usage_for_vk(0x39), Some(0x27)); // 9
+        assert_eq!(usage_for_vk(0x20), Some(0x2C)); // space
+        assert_eq!(usage_for_vk(0x1B), Some(0x29)); // escape
+        assert_eq!(usage_for_vk(0x70), Some(0x3A)); // f1
+        assert_eq!(usage_for_vk(0x7B), Some(0x45)); // f12
+        assert_eq!(usage_for_vk(0x87), Some(0x73)); // f24
+        assert_eq!(usage_for_vk(0x2E), Some(0x4C)); // delete
+                                                    // Modifiers and unknown codes have no mapping (config rejects them).
+        assert_eq!(usage_for_vk(0x10), None);
+        assert_eq!(usage_for_vk(0x00), None);
     }
 }

@@ -35,6 +35,13 @@ confirm = { x = 285, y = 315 }
 [abort_key]
 key = "escape"         # v1 supports "escape" only (BuyDialog cancel path)
 
+[afk_key]
+key = "space"          # key tapped once per AFK semaphore edge (addon-cadenced
+                       # idle reset, active sessions only). Bind this key in
+                       # WoW to a spell/buff or jump; any key-name the kill
+                       # hotkey accepts works (letters, digits, f1-f24, ...);
+                       # modifiers and "escape" are rejected.
+
 [backend]
 # "sendinput" (default), "serial" (build with --features serial), or "vkbm"
 # (versa-kbm RP2040 dongle; on by default since sphinx 0.1). Override per

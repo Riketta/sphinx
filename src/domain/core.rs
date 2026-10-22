@@ -85,6 +85,8 @@ pub struct CoreStats {
     pub aborts: u64,
     /// Watchdog releases (strobe stuck white / unstable CMD past the limit).
     pub watchdogs: u64,
+    /// Anti-AFK key taps delivered (confirmed by the backend).
+    pub afk_taps: u64,
 }
 
 /// What the caller should do after one [`Core::step`].
@@ -113,6 +115,7 @@ pub struct Core<R, K, C, T> {
     clock: T,
     targets: CoreTargets,
     abort_key: Key,
+    afk_key: Key,
     timing: CoreTiming,
     state: State,
     /// Last strobe sample; `None` until the first poll so a strobe that is
@@ -133,7 +136,7 @@ pub struct Core<R, K, C, T> {
 }
 
 impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
-    /// Wires the core to its ports, action coordinates, abort key and timing.
+    /// Wires the core to its ports, action coordinates, keys and timing.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         reader: R,
@@ -142,6 +145,7 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
         clock: T,
         targets: CoreTargets,
         abort_key: Key,
+        afk_key: Key,
         timing: CoreTiming,
         random: Box<dyn Random>,
     ) -> Self {
@@ -152,6 +156,7 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
             clock,
             targets,
             abort_key,
+            afk_key,
             timing,
             state: State::Idle,
             last_strobe: None,
@@ -256,8 +261,10 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
             return;
         };
         // The burst guard runs before the humanized pause so a refused
-        // command does not sleep; ABORT is exempt anyway (escape hatch).
-        if !matches!(command, Command::Abort) && !self.guard_allows(now) {
+        // command does not sleep; ABORT and AFK are exempt anyway (escape
+        // hatch / addon-cadenced idle reset - a refusal would silently eat
+        // the edge and the pulse would just come around next cycle).
+        if !matches!(command, Command::Abort | Command::Afk) && !self.guard_allows(now) {
             return;
         }
         if matches!(command, Command::Buyout | Command::Confirm) {
@@ -290,6 +297,14 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
                 info!(key = ?self.abort_key, "ABORT: one key per edge");
                 if self.kbm.key(self.abort_key) {
                     self.stats.aborts += 1;
+                }
+            }
+            Command::Afk => {
+                // No jitter, no reaction pause: there is no click target and
+                // no purchase timing budget; only the tap matters.
+                info!(key = ?self.afk_key, "AFK: resetting the idle timer");
+                if self.kbm.key(self.afk_key) {
+                    self.stats.afk_taps += 1;
                 }
             }
         }
@@ -484,6 +499,7 @@ mod tests {
             clock.clone(),
             CoreTargets { buyout: BUYOUT, confirm: CONFIRM },
             Key::Escape,
+            Key::Vk(0x20),
             timing,
             Box::new(ZeroRandom),
         )
@@ -710,6 +726,7 @@ mod tests {
             clock.clone(),
             CoreTargets { buyout: BUYOUT, confirm: CONFIRM },
             Key::Escape,
+            Key::Vk(0x20),
             CoreTiming {
                 debounce_ms: 25,
                 watchdog_ms: 200,
@@ -931,6 +948,7 @@ mod tests {
             clock.clone(),
             CoreTargets { buyout: BUYOUT, confirm: CONFIRM },
             Key::Escape,
+            Key::Vk(0x20),
             CoreTiming {
                 debounce_ms: 25,
                 watchdog_ms: 10_000,
@@ -971,6 +989,7 @@ mod tests {
             clock.clone(),
             CoreTargets { buyout: BUYOUT, confirm: CONFIRM },
             Key::Escape,
+            Key::Vk(0x20),
             CoreTiming {
                 debounce_ms: 25,
                 watchdog_ms: 10_000,
@@ -1011,6 +1030,7 @@ mod tests {
             clock.clone(),
             CoreTargets { buyout: BUYOUT, confirm: CONFIRM },
             Key::Escape,
+            Key::Vk(0x20),
             CoreTiming {
                 debounce_ms: 25,
                 watchdog_ms: 10_000,
@@ -1040,6 +1060,78 @@ mod tests {
         assert_eq!(*kbm.keys.borrow(), vec![Key::Escape]);
         assert_eq!(pressed(&kbm), vec![BUYOUT], "abort must not press the mouse");
         assert_eq!(core.stats().aborts, 1);
+    }
+
+    #[test]
+    fn afk_edge_taps_the_configured_key_once() {
+        // AFK is a keyboard-only actuation: no mouse press, no pause, counted
+        // in its own counter.
+        let reader = FakeReader::new(Rgb::BLACK, vec![Rgb::MAGENTA, Rgb::MAGENTA, Rgb::MAGENTA]);
+        let kbm = Rc::new(FakeKbm::default());
+        let kill = Rc::new(FakeKill::default());
+        let clock = clock();
+        let mut core = make_core(&reader, &kbm, &kill, &clock);
+
+        assert_eq!(core.step(), StepOutcome::Continue);
+        reader.strobe.set(Rgb::WHITE);
+        clock.t.set(50);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        clock.t.set(100);
+        assert_eq!(core.step(), StepOutcome::Continue);
+
+        assert_eq!(pressed(&kbm), [] as [(i32, i32); 0]);
+        assert_eq!(kbm.keys.borrow().as_slice(), [Key::Vk(0x20)]);
+        assert_eq!(core.stats().afk_taps, 1);
+        assert_eq!(core.stats().actuations, 0);
+    }
+
+    #[test]
+    fn afk_is_not_throttled_by_the_burst_guard() {
+        // The idle reset is addon-cadenced (5-10 min): a burst-guard refusal
+        // would silently eat the edge for nothing, so AFK is exempt like
+        // ABORT.
+        let reader = FakeReader::new(Rgb::BLACK, vec![Rgb::RED, Rgb::RED, Rgb::RED]);
+        reader.fallback.set(Rgb::MAGENTA);
+        let kbm = Rc::new(FakeKbm::default());
+        let kill = Rc::new(FakeKill::default());
+        let clock = clock();
+        let mut core = Core::new(
+            reader.clone(),
+            kbm.clone(),
+            kill.clone(),
+            clock.clone(),
+            CoreTargets { buyout: BUYOUT, confirm: CONFIRM },
+            Key::Escape,
+            Key::Vk(0x20),
+            CoreTiming {
+                debounce_ms: 25,
+                watchdog_ms: 10_000,
+                min_actuation_interval_ms: 250,
+                max_actuations_per_min: u32::MAX,
+                jitter_px: 0,
+                reaction_min_ms: 0,
+                reaction_max_ms: 0,
+            },
+            Box::new(ZeroRandom),
+        );
+
+        // Purchase at t=100...
+        run_cycle(&reader, &kbm, &kill, &clock, &mut core, 0);
+        assert_eq!(pressed(&kbm), vec![BUYOUT]);
+
+        // ...AFK lands 50ms after the purchase: inside the burst interval,
+        // but the idle reset must still fire.
+        reader.strobe.set(Rgb::BLACK);
+        clock.t.set(150);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        reader.strobe.set(Rgb::WHITE);
+        clock.t.set(200);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        clock.t.set(250);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        assert_eq!(kbm.keys.borrow().as_slice(), [Key::Vk(0x20)]);
+        assert_eq!(pressed(&kbm), vec![BUYOUT], "afk must not press the mouse");
+        assert_eq!(core.stats().afk_taps, 1);
     }
 
     #[test]

@@ -411,6 +411,9 @@ fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
         Some(vk) if vk == VK_ESCAPE => Key::Escape,
         _ => bail!("abort_key {:?} is not supported (v1: \"escape\")", cfg.abort_key.key),
     };
+    // validate() already refused modifiers, ESC and unknown names here.
+    let afk_key =
+        key_code(&cfg.afk_key.key.to_lowercase()).map(Key::Vk).context("afk_key is invalid")?;
     let kill_spec = kill.spec().to_string();
     // Derive the label before `kbm` moves into the core.
     let backend_kind = if dry_run {
@@ -436,6 +439,7 @@ fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
             confirm: (cfg.targets.confirm.x, cfg.targets.confirm.y),
         },
         abort_key,
+        afk_key,
         CoreTiming {
             debounce_ms: cfg.debounce_ms,
             watchdog_ms: cfg.watchdog_ms,
@@ -450,6 +454,7 @@ fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
     info!(
         poll_ms = cfg.poll_ms,
         kill = %kill_spec,
+        afk = %cfg.afk_key.key,
         debounce_ms = cfg.debounce_ms,
         watchdog_ms = cfg.watchdog_ms,
         backend = backend_kind,
@@ -472,6 +477,7 @@ fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
                 uptime_s = start.elapsed().as_secs(),
                 actuations = stats.actuations,
                 aborts = stats.aborts,
+                afk_taps = stats.afk_taps,
                 watchdogs = stats.watchdogs,
                 "heartbeat"
             );
@@ -746,6 +752,10 @@ fn doctor_kill(cfg: &Config) {
         ),
         Err(e) => warn!("kill: {e}"),
     }
+    info!(
+        afk = %cfg.afk_key.key,
+        "afk: key tapped once per AFK semaphore edge (addon-cadenced idle reset)"
+    );
 }
 
 /// Returns 1 only when the game window lies outside the primary monitor

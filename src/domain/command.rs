@@ -26,6 +26,8 @@ impl Rgb {
     pub const GREEN: Self = Self { r: 0, g: 255, b: 0 };
     /// ABORT.
     pub const YELLOW: Self = Self { r: 255, g: 255, b: 0 };
+    /// AFK.
+    pub const MAGENTA: Self = Self { r: 255, g: 0, b: 255 };
 
     /// Builds an exact RGB triple.
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
@@ -48,6 +50,8 @@ pub enum Command {
     Confirm,
     /// `#ffff00`: press ESC once, stop everything.
     Abort,
+    /// `#ff00ff`: tap the configured anti-AFK key once.
+    Afk,
 }
 
 impl Command {
@@ -58,6 +62,7 @@ impl Command {
             c if c == Rgb::RED => Some(Self::Buyout),
             c if c == Rgb::GREEN => Some(Self::Confirm),
             c if c == Rgb::YELLOW => Some(Self::Abort),
+            c if c == Rgb::MAGENTA => Some(Self::Afk),
             _ => None,
         }
     }
@@ -75,6 +80,7 @@ mod tests {
         assert!(matches!(Command::from_rgb(Rgb::RED), Some(Command::Buyout)));
         assert!(matches!(Command::from_rgb(Rgb::GREEN), Some(Command::Confirm)));
         assert!(matches!(Command::from_rgb(Rgb::YELLOW), Some(Command::Abort)));
+        assert!(matches!(Command::from_rgb(Rgb::MAGENTA), Some(Command::Afk)));
     }
 
     #[test]

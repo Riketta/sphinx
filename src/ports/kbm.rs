@@ -1,10 +1,14 @@
 //! Outbound port: actuation against the game UI.
 
-/// A key sphinx can send. v1 only needs ESC (ABORT / `BuyDialog` cancel).
+/// A key sphinx can send. ESC covers ABORT (`BuyDialog` cancel); the raw
+/// VK code covers config-driven keybinds (the anti-AFK spell/buff key).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
     /// The ESC key.
     Escape,
+    /// A raw Windows virtual-key code (anti-AFK keybind); resolved from the
+    /// config's key name at startup.
+    Vk(u8),
 }
 
 /// Keyboard/mouse backend. Coordinates are **game-window client pixels**;
