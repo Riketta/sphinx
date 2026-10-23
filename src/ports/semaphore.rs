@@ -11,6 +11,13 @@ pub trait SemaphoreReader {
     /// "idle", which is the safe direction: no actuation).
     fn read_cmd(&mut self) -> Rgb;
 
+    /// Samples the CMD2 pixel (the pair-extension modifier; black = no
+    /// modifier). Readers that predate the pair wire report black, which
+    /// decodes every classic command unchanged.
+    fn read_cmd2(&mut self) -> Rgb {
+        Rgb::BLACK
+    }
+
     /// Samples the STROBE pixel (same failure semantics).
     fn read_strobe(&mut self) -> Rgb;
 }

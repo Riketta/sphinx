@@ -65,8 +65,10 @@ kind = "vkbm"   # the RP2040 board; "sendinput" is the software fallback
 ```
 
 In WoW, run `/auctimogger semaphore coords` and paste the printed points into
-`[pixels]` / `[targets]`. Re-do this after any window *resize* (window
-*movement* is fine — points resolve against the live client rect).
+`[pixels]` / `[targets]` (open the commodity buy screen for `buyout`, the item
+buy screen with a listing selected for `buyout_item`). Re-do this after any
+window *resize* (window *movement* is fine — points resolve against the live
+client rect).
 
 **4. Verify and calibrate:**
 

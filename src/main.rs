@@ -271,6 +271,7 @@ fn build_reader(cfg: &Config) -> PixelReader {
         GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref()),
         (cfg.pixels.cmd.x, cfg.pixels.cmd.y),
         (cfg.pixels.strobe.x, cfg.pixels.strobe.y),
+        cfg.pixels.cmd2.as_ref().map(|p| (p.x, p.y)),
     )
 }
 
@@ -437,6 +438,10 @@ fn run(cfg: &Config, dry_run: bool) -> anyhow::Result<()> {
         CoreTargets {
             buyout: (cfg.targets.buyout.x, cfg.targets.buyout.y),
             confirm: (cfg.targets.confirm.x, cfg.targets.confirm.y),
+            buyout_item: cfg.targets.buyout_item.as_ref().map(|p| (p.x, p.y)),
+            confirm_item: cfg.targets.confirm_item.as_ref().map(|p| (p.x, p.y)),
+            search_item: cfg.targets.search_item.as_ref().map(|p| (p.x, p.y)),
+            browse_row: cfg.targets.browse_row.as_ref().map(|p| (p.x, p.y)),
         },
         abort_key,
         afk_key,
@@ -497,13 +502,25 @@ fn calibrate(cfg: &Config) -> anyhow::Result<()> {
         let strobe = reader.read_point((cfg.pixels.strobe.x, cfg.pixels.strobe.y));
         let buyout = reader.read_point((cfg.targets.buyout.x, cfg.targets.buyout.y));
         let confirm = reader.read_point((cfg.targets.confirm.x, cfg.targets.confirm.y));
-        info!(
-            cmd = %cmd,
-            strobe = %strobe,
-            buyout = %buyout,
-            confirm = %confirm,
-            "sample"
-        );
+        if let Some(p) = cfg.targets.buyout_item.as_ref() {
+            let item = reader.read_point((p.x, p.y));
+            info!(
+                cmd = %cmd,
+                strobe = %strobe,
+                buyout = %buyout,
+                buyout_item = %item,
+                confirm = %confirm,
+                "sample"
+            );
+        } else {
+            info!(
+                cmd = %cmd,
+                strobe = %strobe,
+                buyout = %buyout,
+                confirm = %confirm,
+                "sample (no buyout_item configured)"
+            );
+        }
         thread::sleep(Duration::from_secs(1));
     }
 }
@@ -681,12 +698,27 @@ fn doctor_pixels(cfg: &Config) -> usize {
     if let Some(info) =
         GameWindow::new(&cfg.process_names(), cfg.window_title_filter().as_deref()).find()
     {
-        let points = [
+        let mut points = vec![
             ("cmd", cfg.pixels.cmd.x, cfg.pixels.cmd.y),
             ("strobe", cfg.pixels.strobe.x, cfg.pixels.strobe.y),
             ("buyout", cfg.targets.buyout.x, cfg.targets.buyout.y),
             ("confirm", cfg.targets.confirm.x, cfg.targets.confirm.y),
         ];
+        if let Some(p) = cfg.pixels.cmd2.as_ref() {
+            points.push(("cmd2", p.x, p.y));
+        }
+        if let Some(p) = cfg.targets.buyout_item.as_ref() {
+            points.push(("buyout_item", p.x, p.y));
+        }
+        if let Some(p) = cfg.targets.confirm_item.as_ref() {
+            points.push(("confirm_item", p.x, p.y));
+        }
+        if let Some(p) = cfg.targets.search_item.as_ref() {
+            points.push(("search_item", p.x, p.y));
+        }
+        if let Some(p) = cfg.targets.browse_row.as_ref() {
+            points.push(("browse_row", p.x, p.y));
+        }
         for (name, x, y) in points {
             if x < 0 || y < 0 || x >= info.client.0 || y >= info.client.1 {
                 warn!(
@@ -733,11 +765,21 @@ fn doctor_pixels(cfg: &Config) -> usize {
     }
     let buyout = reader.read_point((cfg.targets.buyout.x, cfg.targets.buyout.y));
     let confirm = reader.read_point((cfg.targets.confirm.x, cfg.targets.confirm.y));
-    info!(
-        buyout = %buyout,
-        confirm = %confirm,
-        "targets: samples (meaningful with the AH buy screen open; use `calibrate` to align)"
-    );
+    if let Some(p) = cfg.targets.buyout_item.as_ref() {
+        let item = reader.read_point((p.x, p.y));
+        info!(
+            buyout = %buyout,
+            buyout_item = %item,
+            confirm = %confirm,
+            "targets: samples (meaningful with the AH buy screen open; use `calibrate` to align)"
+        );
+    } else {
+        info!(
+            buyout = %buyout,
+            confirm = %confirm,
+            "targets: samples (meaningful with the AH buy screen open; use `calibrate` to align)"
+        );
+    }
     failures
 }
 

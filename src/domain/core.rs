@@ -48,6 +48,20 @@ pub struct CoreTargets {
     pub buyout: (i32, i32),
     /// `AuctionHouseFrame.BuyDialog` `BuyNowButton` position.
     pub confirm: (i32, i32),
+    /// Item buy screen's `BuyoutFrame` `BuyoutButton` position. `None` until
+    /// calibrated: the BUYOUT-ITEM command logs and is skipped, commodities
+    /// keep working.
+    pub buyout_item: Option<(i32, i32)>,
+    /// Item confirm popup's accept button position. `None` until calibrated:
+    /// the CONFIRM-ITEM command logs and is skipped, commodities keep
+    /// working.
+    pub confirm_item: Option<(i32, i32)>,
+    /// AH search bar's search button position. `None` until calibrated: the
+    /// SEARCH-ITEM command logs and is skipped.
+    pub search_item: Option<(i32, i32)>,
+    /// Browse results list's first row position. `None` until calibrated:
+    /// the BROWSE-ROW command logs and is skipped.
+    pub browse_row: Option<(i32, i32)>,
 }
 
 /// Contract timings (debounce, watchdog) plus the burst guard, config-driven.
@@ -101,8 +115,8 @@ pub enum StepOutcome {
 enum State {
     /// Waiting for a strobe rising edge.
     Idle,
-    /// CMD observed at the edge; sampling until it proves stable.
-    Debounce { cmd: Rgb, first_ms: u64, edge_ms: u64 },
+    /// (CMD, CMD2) observed at the edge; sampling until both prove stable.
+    Debounce { cmd: Rgb, cmd2: Rgb, first_ms: u64, edge_ms: u64 },
     /// Actuated; waiting for the addon to rest strobe back to black.
     WaitClear { since_ms: u64 },
 }
@@ -195,6 +209,21 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
         )
     }
 
+    /// One optional-target press: the calibrated point, or a logged skip
+    /// when it was never configured (the addon's stage machine owns the
+    /// retry; every other target keeps working without it).
+    fn press_optional(&mut self, target: Option<(i32, i32)>, press: &str, missing: &str) {
+        let Some(target) = target else {
+            warn!("{}", missing);
+            return;
+        };
+        let (x, y) = self.jitter(target);
+        info!(x, y, press);
+        if self.kbm.press(x, y) {
+            self.stats.actuations += 1;
+        }
+    }
+
     /// Runs one poll. Never panics on bad input: unknown colors are logged
     /// and ignored, by construction.
     pub fn step(&mut self) -> StepOutcome {
@@ -210,11 +239,12 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
             State::Idle => {
                 if edge {
                     let cmd = self.reader.read_cmd();
-                    debug!(cmd = %cmd, "strobe rising edge");
-                    self.state = State::Debounce { cmd, first_ms: now, edge_ms: now };
+                    let cmd2 = self.reader.read_cmd2();
+                    debug!(cmd = %cmd, cmd2 = %cmd2, "strobe rising edge");
+                    self.state = State::Debounce { cmd, cmd2, first_ms: now, edge_ms: now };
                 }
             }
-            State::Debounce { cmd, first_ms, edge_ms } => {
+            State::Debounce { cmd, cmd2, first_ms, edge_ms } => {
                 if !white {
                     debug!("strobe fell black during debounce -> idle");
                     self.state = State::Idle;
@@ -224,12 +254,14 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
                     self.state = State::Idle;
                 } else {
                     let sample = self.reader.read_cmd();
-                    if sample != cmd {
-                        debug!(%sample, "CMD changed during debounce -> restart");
-                        self.state = State::Debounce { cmd: sample, first_ms: now, edge_ms };
+                    let sample2 = self.reader.read_cmd2();
+                    if sample != cmd || sample2 != cmd2 {
+                        debug!(%sample, %sample2, "CMD pair changed during debounce -> restart");
+                        self.state =
+                            State::Debounce { cmd: sample, cmd2: sample2, first_ms: now, edge_ms };
                     } else if now.saturating_sub(first_ms) >= self.timing.debounce_ms {
                         self.state = State::WaitClear { since_ms: now };
-                        self.decode_and_execute(sample, now);
+                        self.decode_and_execute(sample, sample2, now);
                     }
                 }
             }
@@ -255,9 +287,9 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
     /// Decodes a stable CMD and actuates once. The `WaitClear` state is
     /// already entered by the caller, so a failed decode still swallows the
     /// strobe until it rests black (one command per rising edge).
-    fn decode_and_execute(&mut self, sample: Rgb, now: u64) {
-        let Some(command) = Command::from_rgb(sample) else {
-            warn!(color = %sample, "committed CMD is not a known command -> ignored");
+    fn decode_and_execute(&mut self, sample: Rgb, sample2: Rgb, now: u64) {
+        let Some(command) = Command::from_pair(sample, sample2) else {
+            warn!(color = %sample, modifier = %sample2, "committed CMD is not a known command -> ignored");
             return;
         };
         // The burst guard runs before the humanized pause so a refused
@@ -267,15 +299,24 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
         if !matches!(command, Command::Abort | Command::Afk) && !self.guard_allows(now) {
             return;
         }
-        if matches!(command, Command::Buyout | Command::Confirm) {
+        if matches!(
+            command,
+            Command::Buyout
+                | Command::BuyoutItem
+                | Command::Confirm
+                | Command::ConfirmItem
+                | Command::SearchItem
+                | Command::BrowseRow
+        ) {
             self.react();
         }
         // Re-verify immediately before actuation: one fresh read. The
         // humanized pause above widens the edge->click window, so this
         // check deliberately runs after it.
         let verified = self.reader.read_cmd();
-        if verified != sample {
-            warn!(expected = %sample, read = %verified, "CMD changed before actuation -> ignored");
+        let verified2 = self.reader.read_cmd2();
+        if verified != sample || verified2 != sample2 {
+            warn!(expected = %sample, read = %verified, expected2 = %sample2, read2 = %verified2, "CMD changed before actuation -> ignored");
             return;
         }
         match command {
@@ -293,6 +334,30 @@ impl<R: SemaphoreReader, K: Kbm, C: ControlInput, T: Clock> Core<R, K, C, T> {
                     self.stats.actuations += 1;
                 }
             }
+            Command::BuyoutItem => self.press_optional(
+                self.targets.buyout_item,
+                "BUYOUT-ITEM: pressing the item buy screen's Buyout button",
+                "BUYOUT-ITEM: no buyout_item target configured -> ignored; add it from \
+                 `/auctimogger semaphore coords` with an item listing open",
+            ),
+            Command::ConfirmItem => self.press_optional(
+                self.targets.confirm_item,
+                "CONFIRM-ITEM: pressing the confirm popup's accept button",
+                "CONFIRM-ITEM: no confirm_item target configured -> ignored; add it from \
+                 `/auctimogger semaphore coords` with the confirm popup open",
+            ),
+            Command::SearchItem => self.press_optional(
+                self.targets.search_item,
+                "SEARCH-ITEM: clicking the AH search bar's search button",
+                "SEARCH-ITEM: no search_item target configured -> ignored; add it from \
+                 `/auctimogger semaphore coords` with the AH open",
+            ),
+            Command::BrowseRow => self.press_optional(
+                self.targets.browse_row,
+                "BROWSE-ROW: clicking the browse results' first row",
+                "BROWSE-ROW: no browse_row target configured -> ignored; add it from \
+                 `/auctimogger semaphore coords` with browse results on screen",
+            ),
             Command::Abort => {
                 info!(key = ?self.abort_key, "ABORT: one key per edge");
                 if self.kbm.key(self.abort_key) {
@@ -497,7 +562,14 @@ mod tests {
             kbm.clone(),
             kill.clone(),
             clock.clone(),
-            CoreTargets { buyout: BUYOUT, confirm: CONFIRM },
+            CoreTargets {
+                buyout: BUYOUT,
+                confirm: CONFIRM,
+                buyout_item: None,
+                confirm_item: None,
+                search_item: None,
+                browse_row: None,
+            },
             Key::Escape,
             Key::Vk(0x20),
             timing,
@@ -724,7 +796,14 @@ mod tests {
             kbm.clone(),
             kill.clone(),
             clock.clone(),
-            CoreTargets { buyout: BUYOUT, confirm: CONFIRM },
+            CoreTargets {
+                buyout: BUYOUT,
+                confirm: CONFIRM,
+                buyout_item: None,
+                confirm_item: None,
+                search_item: None,
+                browse_row: None,
+            },
             Key::Escape,
             Key::Vk(0x20),
             CoreTiming {
@@ -809,6 +888,237 @@ mod tests {
         assert_eq!(core.step(), StepOutcome::Continue);
         assert_eq!(pressed(&kbm), vec![CONFIRM], "abort must not press the mouse");
         assert_eq!(*kbm.keys.borrow(), vec![Key::Escape]);
+    }
+
+    #[test]
+    fn buyout_item_presses_its_target_only_when_configured() {
+        let new_reader = || FakeReader::new(Rgb::BLACK, vec![Rgb::CYAN, Rgb::CYAN, Rgb::CYAN]);
+
+        // Unconfigured (make_core passes None): the edge is consumed, the
+        // command is skipped - commodities keep working without the target.
+        let reader = new_reader();
+        let kbm = Rc::new(FakeKbm::default());
+        let clock = clock();
+        let mut core = make_core(&reader, &kbm, &Rc::new(FakeKill::default()), &clock);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        reader.strobe.set(Rgb::WHITE);
+        clock.t.set(50);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        clock.t.set(100);
+        assert_eq!(core.step(), StepOutcome::Continue, "stable CYAN debounce");
+        assert_eq!(pressed(&kbm), vec![], "no target configured: nothing pressed");
+
+        // Configured: the same command presses the item screen's Buyout.
+        let reader = new_reader();
+        let kbm = Rc::new(FakeKbm::default());
+        let clock = Rc::new(FakeClock { t: Cell::new(0) });
+        let mut core = Core::new(
+            reader.clone(),
+            kbm.clone(),
+            Rc::new(FakeKill::default()),
+            clock.clone(),
+            CoreTargets {
+                buyout: BUYOUT,
+                confirm: CONFIRM,
+                buyout_item: Some((50, 60)),
+                confirm_item: None,
+                search_item: None,
+                browse_row: None,
+            },
+            Key::Escape,
+            Key::Vk(0x20),
+            CoreTiming {
+                debounce_ms: 25,
+                watchdog_ms: 10_000,
+                min_actuation_interval_ms: 0,
+                max_actuations_per_min: u32::MAX,
+                jitter_px: 0,
+                reaction_min_ms: 0,
+                reaction_max_ms: 0,
+            },
+            Box::new(ZeroRandom),
+        );
+        assert_eq!(core.step(), StepOutcome::Continue);
+        reader.strobe.set(Rgb::WHITE);
+        clock.t.set(50);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        clock.t.set(100);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        assert_eq!(pressed(&kbm), vec![(50, 60)]);
+        assert_eq!(core.stats().actuations, 1);
+    }
+
+    #[test]
+    fn search_item_presses_its_target_only_when_configured() {
+        let new_reader =
+            || FakeReader::new(Rgb::BLACK, vec![Rgb::ORANGE, Rgb::ORANGE, Rgb::ORANGE]);
+
+        // Unconfigured: the edge is consumed, nothing pressed.
+        let reader = new_reader();
+        let kbm = Rc::new(FakeKbm::default());
+        let clock = clock();
+        let mut core = make_core(&reader, &kbm, &Rc::new(FakeKill::default()), &clock);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        reader.strobe.set(Rgb::WHITE);
+        clock.t.set(50);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        clock.t.set(100);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        assert_eq!(pressed(&kbm), vec![], "no target configured: nothing pressed");
+
+        // Configured: the same command presses the search button.
+        let reader = new_reader();
+        let kbm = Rc::new(FakeKbm::default());
+        let clock = Rc::new(FakeClock { t: Cell::new(0) });
+        let mut core = Core::new(
+            reader.clone(),
+            kbm.clone(),
+            Rc::new(FakeKill::default()),
+            clock.clone(),
+            CoreTargets {
+                buyout: BUYOUT,
+                confirm: CONFIRM,
+                buyout_item: None,
+                confirm_item: None,
+                search_item: Some((30, 40)),
+                browse_row: None,
+            },
+            Key::Escape,
+            Key::Vk(0x20),
+            CoreTiming {
+                debounce_ms: 25,
+                watchdog_ms: 10_000,
+                min_actuation_interval_ms: 0,
+                max_actuations_per_min: u32::MAX,
+                jitter_px: 0,
+                reaction_min_ms: 0,
+                reaction_max_ms: 0,
+            },
+            Box::new(ZeroRandom),
+        );
+        assert_eq!(core.step(), StepOutcome::Continue);
+        reader.strobe.set(Rgb::WHITE);
+        clock.t.set(50);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        clock.t.set(100);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        assert_eq!(pressed(&kbm), vec![(30, 40)]);
+        assert_eq!(core.stats().actuations, 1);
+    }
+
+    #[test]
+    fn browse_row_presses_its_target_only_when_configured() {
+        let new_reader =
+            || FakeReader::new(Rgb::BLACK, vec![Rgb::PURPLE, Rgb::PURPLE, Rgb::PURPLE]);
+
+        // Unconfigured: the edge is consumed, nothing pressed.
+        let reader = new_reader();
+        let kbm = Rc::new(FakeKbm::default());
+        let clock = clock();
+        let mut core = make_core(&reader, &kbm, &Rc::new(FakeKill::default()), &clock);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        reader.strobe.set(Rgb::WHITE);
+        clock.t.set(50);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        clock.t.set(100);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        assert_eq!(pressed(&kbm), vec![], "no target configured: nothing pressed");
+
+        // Configured: the same command presses the browse list's first row.
+        let reader = new_reader();
+        let kbm = Rc::new(FakeKbm::default());
+        let clock = Rc::new(FakeClock { t: Cell::new(0) });
+        let mut core = Core::new(
+            reader.clone(),
+            kbm.clone(),
+            Rc::new(FakeKill::default()),
+            clock.clone(),
+            CoreTargets {
+                buyout: BUYOUT,
+                confirm: CONFIRM,
+                buyout_item: None,
+                confirm_item: None,
+                search_item: None,
+                browse_row: Some((90, 100)),
+            },
+            Key::Escape,
+            Key::Vk(0x20),
+            CoreTiming {
+                debounce_ms: 25,
+                watchdog_ms: 10_000,
+                min_actuation_interval_ms: 0,
+                max_actuations_per_min: u32::MAX,
+                jitter_px: 0,
+                reaction_min_ms: 0,
+                reaction_max_ms: 0,
+            },
+            Box::new(ZeroRandom),
+        );
+        assert_eq!(core.step(), StepOutcome::Continue);
+        reader.strobe.set(Rgb::WHITE);
+        clock.t.set(50);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        clock.t.set(100);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        assert_eq!(pressed(&kbm), vec![(90, 100)]);
+        assert_eq!(core.stats().actuations, 1);
+    }
+
+    #[test]
+    fn confirm_item_presses_its_target_only_when_configured() {
+        let new_reader = || FakeReader::new(Rgb::BLACK, vec![Rgb::BLUE, Rgb::BLUE, Rgb::BLUE]);
+
+        // Unconfigured: the edge is consumed, nothing pressed.
+        let reader = new_reader();
+        let kbm = Rc::new(FakeKbm::default());
+        let clock = clock();
+        let mut core = make_core(&reader, &kbm, &Rc::new(FakeKill::default()), &clock);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        reader.strobe.set(Rgb::WHITE);
+        clock.t.set(50);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        clock.t.set(100);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        assert_eq!(pressed(&kbm), vec![], "no target configured: nothing pressed");
+
+        // Configured: the same command presses the confirm popup's accept.
+        let reader = new_reader();
+        let kbm = Rc::new(FakeKbm::default());
+        let clock = Rc::new(FakeClock { t: Cell::new(0) });
+        let mut core = Core::new(
+            reader.clone(),
+            kbm.clone(),
+            Rc::new(FakeKill::default()),
+            clock.clone(),
+            CoreTargets {
+                buyout: BUYOUT,
+                confirm: CONFIRM,
+                buyout_item: None,
+                confirm_item: Some((70, 80)),
+                search_item: None,
+                browse_row: None,
+            },
+            Key::Escape,
+            Key::Vk(0x20),
+            CoreTiming {
+                debounce_ms: 25,
+                watchdog_ms: 10_000,
+                min_actuation_interval_ms: 0,
+                max_actuations_per_min: u32::MAX,
+                jitter_px: 0,
+                reaction_min_ms: 0,
+                reaction_max_ms: 0,
+            },
+            Box::new(ZeroRandom),
+        );
+        assert_eq!(core.step(), StepOutcome::Continue);
+        reader.strobe.set(Rgb::WHITE);
+        clock.t.set(50);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        clock.t.set(100);
+        assert_eq!(core.step(), StepOutcome::Continue);
+        assert_eq!(pressed(&kbm), vec![(70, 80)]);
+        assert_eq!(core.stats().actuations, 1);
     }
 
     #[test]
@@ -946,7 +1256,14 @@ mod tests {
             kbm.clone(),
             kill.clone(),
             clock.clone(),
-            CoreTargets { buyout: BUYOUT, confirm: CONFIRM },
+            CoreTargets {
+                buyout: BUYOUT,
+                confirm: CONFIRM,
+                buyout_item: None,
+                confirm_item: None,
+                search_item: None,
+                browse_row: None,
+            },
             Key::Escape,
             Key::Vk(0x20),
             CoreTiming {
@@ -987,7 +1304,14 @@ mod tests {
             kbm.clone(),
             kill.clone(),
             clock.clone(),
-            CoreTargets { buyout: BUYOUT, confirm: CONFIRM },
+            CoreTargets {
+                buyout: BUYOUT,
+                confirm: CONFIRM,
+                buyout_item: None,
+                confirm_item: None,
+                search_item: None,
+                browse_row: None,
+            },
             Key::Escape,
             Key::Vk(0x20),
             CoreTiming {
@@ -1028,7 +1352,14 @@ mod tests {
             kbm.clone(),
             kill.clone(),
             clock.clone(),
-            CoreTargets { buyout: BUYOUT, confirm: CONFIRM },
+            CoreTargets {
+                buyout: BUYOUT,
+                confirm: CONFIRM,
+                buyout_item: None,
+                confirm_item: None,
+                search_item: None,
+                browse_row: None,
+            },
             Key::Escape,
             Key::Vk(0x20),
             CoreTiming {
@@ -1100,7 +1431,14 @@ mod tests {
             kbm.clone(),
             kill.clone(),
             clock.clone(),
-            CoreTargets { buyout: BUYOUT, confirm: CONFIRM },
+            CoreTargets {
+                buyout: BUYOUT,
+                confirm: CONFIRM,
+                buyout_item: None,
+                confirm_item: None,
+                search_item: None,
+                browse_row: None,
+            },
             Key::Escape,
             Key::Vk(0x20),
             CoreTiming {

@@ -24,13 +24,29 @@ reaction_max_ms = 50     # humanize: max reaction pause; ABORT is never delayed 
 screen   = { width = 1920, height = 1080 }
 ui_scale = 0.65
 
-[pixels]               # REQUIRED, from `/auctimogger semaphore coords` (no defaults)
+[pixels]              # REQUIRED, from `/auctimogger semaphore coords` (no defaults)
 cmd    = { x = 7, y = 7 }
 strobe = { x = 7, y = 15 }
 
 [targets]              # REQUIRED, live button centers from `/auctimogger semaphore coords`
-buyout  = { x = 304, y = 434 }
-confirm = { x = 285, y = 315 }
+buyout  = { x = 304, y = 434 }  # commodity buy screen's Buy Now button
+confirm = { x = 285, y = 315 }  # buy dialog's Buy Now button
+# Optional: the ITEM buy screen's Buyout button (non-stackable deals). Run
+# coords with an item listing open to get it; without it the BUYOUT-ITEM
+# command (cyan) logs and is skipped:
+# buyout_item = { x = 713, y = 583 }
+# Optional: the item confirm popup's accept button (StaticPopup1). Run coords
+# while that popup is open (hand-buy an item, leave the popup up) to get it;
+# without it the CONFIRM-ITEM command (blue) logs and is skipped - NOTE the
+# addon first tries clicking the popup itself, so this target only matters
+# when the fork refuses that:
+# confirm_item = { x = 960, y = 586 }
+# Optional: the fork's search-gate targets. The gate only answers hardware
+# searches, so when an ITEM deal is found hands-off the addon fills the
+# search box and sphinx supplies the clicks: SEARCH-ITEM (orange) presses
+# the search button, BROWSE-ROW (purple) clicks the browse list's first row.
+# search_item = { x = 1810, y = 28 }   # run coords with the AH open
+# browse_row = { x = 400, y = 130 }    # run coords with browse results on screen
 
 [abort_key]
 key = "escape"         # v1 supports "escape" only (BuyDialog cancel path)

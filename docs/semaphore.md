@@ -22,10 +22,12 @@ above game UI), `EnableMouse(false)` (input-transparent), anchored to
 | Pixel  | Color     | Meaning                                              |
 |--------|-----------|------------------------------------------------------|
 | CMD    | `#000000` | idle / no command                                    |
-| CMD    | `#FF0000` | BUYOUT — actuate the native Buyout button            |
+| CMD    | `#FF0000` | BUYOUT — actuate the commodity screen's Buy Now button |
 | CMD    | `#00FF00` | CONFIRM — actuate the buy dialog's Buy Now button    |
 | CMD    | `#FFFF00` | ABORT — press ESC; stop everything                   |
 | CMD    | `#FF00FF` | AFK — tap the configured anti-AFK key once           |
+| CMD    | `#00FFFF` | BUYOUT-ITEM — actuate the item buy screen's Buyout button |
+| CMD    | `#0000FF` | CONFIRM-ITEM — actuate the item confirm popup's accept button |
 | STROBE | `#000000` | idle                                                 |
 | STROBE | `#FFFFFF` | the current CMD is committed (rising edge = execute) |
 
@@ -110,13 +112,22 @@ sphinx's implementation of its side of the contract:
 
 Physical pixels, top-left origin. The writer computes and prints paste-ready
 values — run `/auctimogger semaphore coords` in WoW **with the AH buy screen
-open** (the two button points are read from the live buttons):
+open** (the button points are read from the live buttons: `buyout` needs the
+commodity buy screen, `buyout_item` the item buy screen with a listing
+selected — a line reports `-` when its screen is not up). Every point is the
+button's **center** (a click there tolerates the configured jitter; corner
+points miss the edge), and each line carries the full button rect as a TOML
+comment for verification:
 
 ```
-cmd     = (x=7, y=7)
-strobe  = (x=7, y=15)
-buyout  = (x=304, y=434)
-confirm = (x=285, y=315)
+cmd    = { x = 10, y = 10 }
+strobe = { x = 10, y = 18 }
+buyout = { x = 335, y = 461 }  # rect (296,450)-(374,472)
+buyout_item = { x = 707, y = 584 }  # rect (619,573)-(707,595)
+confirm = { x = 320, y = 341 }  # rect (276,330)-(364,352)
+confirm_item = { x = 960, y = 586 }  # rect — only readable while the popup is open
+search_item = { x = 1810, y = 28 }  # the search bar's search button (readable whenever the AH is open)
+browse_row = { x = 400, y = 130 }  # the browse list's first row (only readable while browse results are up)
 screen  = (width=1920, height=1080)
 uiScale = 0.65
 ```

@@ -135,6 +135,11 @@ pub struct PixelPoints {
     pub cmd: Point,
     /// STROBE pixel.
     pub strobe: Point,
+    /// CMD2 pixel (the pair-extension modifier; optional for configs that
+    /// predate it - without it every pair reads as unmodified and the
+    /// SEARCH-ITEM / BROWSE-ROW commands log and are skipped).
+    #[serde(default)]
+    pub cmd2: Option<Point>,
 }
 
 /// Target button points, from `/auctimogger semaphore coords`.
@@ -145,6 +150,22 @@ pub struct TargetPoints {
     pub buyout: Point,
     /// `BuyDialog` `BuyNowButton`.
     pub confirm: Point,
+    /// Item buy screen's `BuyoutFrame` `BuyoutButton` (optional until item
+    /// sniping is used; the BUYOUT-ITEM command is skipped without it).
+    #[serde(default)]
+    pub buyout_item: Option<Point>,
+    /// Item confirm popup's accept button (optional until item sniping is
+    /// used; the CONFIRM-ITEM command is skipped without it).
+    #[serde(default)]
+    pub confirm_item: Option<Point>,
+    /// AH search bar's search button (optional until the fork's search-gate
+    /// stages are used; the SEARCH-ITEM command is skipped without it).
+    #[serde(default)]
+    pub search_item: Option<Point>,
+    /// Browse results list's first row (optional; the BROWSE-ROW command is
+    /// skipped without it).
+    #[serde(default)]
+    pub browse_row: Option<Point>,
 }
 
 /// ABORT actuation key settings.

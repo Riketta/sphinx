@@ -73,6 +73,7 @@ pub struct PixelReader {
     game: GameWindow,
     cmd: (i32, i32),
     strobe: (i32, i32),
+    cmd2: Option<(i32, i32)>,
     cached: Option<GameWindowInfo>,
     refreshed_at: Option<Instant>,
     last_find_attempt: Option<Instant>,
@@ -82,11 +83,18 @@ pub struct PixelReader {
 
 impl PixelReader {
     /// Builds a reader for the given pixel points (client-relative px).
-    pub fn new(game: GameWindow, cmd: (i32, i32), strobe: (i32, i32)) -> Self {
+    /// `cmd2` is the pair-extension modifier pixel (None = reads black).
+    pub fn new(
+        game: GameWindow,
+        cmd: (i32, i32),
+        strobe: (i32, i32),
+        cmd2: Option<(i32, i32)>,
+    ) -> Self {
         Self {
             game,
             cmd,
             strobe,
+            cmd2,
             cached: None,
             refreshed_at: None,
             last_find_attempt: None,
@@ -190,6 +198,13 @@ impl SemaphoreReader for PixelReader {
         self.read_point(self.cmd)
     }
 
+    fn read_cmd2(&mut self) -> Rgb {
+        match self.cmd2 {
+            Some(point) => self.read_point(point),
+            None => Rgb::BLACK,
+        }
+    }
+
     fn read_strobe(&mut self) -> Rgb {
         self.read_point(self.strobe)
     }
@@ -201,7 +216,7 @@ mod tests {
 
     #[test]
     fn alternating_failures_do_not_flood() {
-        let mut reader = PixelReader::new(GameWindow::new(&[], None), (0, 0), (0, 0));
+        let mut reader = PixelReader::new(GameWindow::new(&[], None), (0, 0), (0, 0), None);
         assert!(reader.should_warn("cmd failed"));
         assert!(reader.should_warn("strobe failed"));
         // The same two messages alternating must be suppressed inside the
