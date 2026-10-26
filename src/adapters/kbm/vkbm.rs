@@ -824,8 +824,10 @@ const CHUNK_STREAM_MS: u64 = 8;
 /// reports cross a 4 ms-poll endpoint and the HID stack, so an immediate
 /// `GetCursorPos` samples a half-applied move - measured gains swing
 /// wildly (even invert sign), and the loop thrashes (observed live
-/// 2026-10-20). A short drain makes every measurement complete.
-const REPORT_SETTLE_MS: u64 = 25;
+/// 2026-10-20). A short drain makes every measurement complete. 20 ms
+/// keeps >=3 endpoint polls of margin; 10 ms samples inside the drain
+/// band (4 ms endpoint + HID stack jitter) and risks the same thrash.
+const REPORT_SETTLE_MS: u64 = 20;
 
 /// The real cursor: `GetCursorPos` reads, `MoveRel` requests for nudges.
 struct OsRelPointer<'a> {
